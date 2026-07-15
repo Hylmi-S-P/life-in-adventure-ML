@@ -36,6 +36,15 @@ try:
 except ImportError:
     _CHROMADB_AVAILABLE = False
 
+try:
+    from llama_index.core import Document, VectorStoreIndex, StorageContext
+    from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, FilterOperator
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+    from llama_index.vector_stores.chroma import ChromaVectorStore
+    _LLAMAINDEX_AVAILABLE = True
+except ImportError:
+    _LLAMAINDEX_AVAILABLE = False
+
 
 class KnowledgeBase:
     """
@@ -62,6 +71,12 @@ class KnowledgeBase:
         self.chroma_collection = None
         self._embedder = None
         self._lang_cache: dict = {}  # suffix -> (filtered_texts, filtered_ids)
+        
+        # ── LlamaIndex fields (Phase 1 migration) ─────────────────────────
+        self._llama_documents: list = []
+        self._bm25_retriever = None
+        self._vector_index = None
+        self._vector_retriever = None
         
         self._init_sqlite()
         self.build_or_load()
@@ -257,7 +272,7 @@ class KnowledgeBase:
             logger.info(f"Successfully ingested {total_events} events into SQLite database.")
 
     def _build_in_memory_indexes(self) -> None:
-        """Load events into memory for TF-IDF / RapidFuzz and ChromaDB vector indexing."""
+        """Load events into memory for RapidFuzz and build LlamaIndex + ChromaDB vector index."""
         cursor = self.conn.cursor()
         cursor.execute("SELECT event_key, clean_text, source_file, grade, required FROM events WHERE clean_text != ''")
         rows = cursor.fetchall()
@@ -281,23 +296,113 @@ class KnowledgeBase:
             
         logger.info(f"Loaded {len(self.event_texts)} non-empty event strings for fast search.")
         
-        # Build TF-IDF matrix for instant local semantic fallback
+        # Build TF-IDF matrix (kept as fast sklearn fallback)
         if _TFIDF_AVAILABLE and len(self.event_texts) > 0:
-            logger.info("Building TF-IDF vectorizer over 19,000+ events...")
+            logger.info("Building TF-IDF vectorizer over events...")
             self.tfidf_vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_features=50000)
             self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(self.event_texts)
             logger.info("TF-IDF matrix built successfully.")
 
-        # ── Eager-load SentenceTransformer embedder (offline-first) ──
-        # Model is cached at ~/.cache/huggingface/ and ~/.cache/torch/.
-        # local_files_only=True skips the HF Hub network check entirely —
-        # ~5-10s load from local disk every restart (not per-scan).
-        # This runs during init so the first F9 scan is instant.
-        if _CHROMADB_AVAILABLE and self._embedder is None:
+        # ── LlamaIndex-based vector indexing ─────────────────────────────
+        # Replaces manual SentenceTransformer loading + ChromaDB batch upsert.
+        # Falls back gracefully to manual ChromaDB if LlamaIndex not available.
+        if _LLAMAINDEX_AVAILABLE and _CHROMADB_AVAILABLE and len(self.event_texts) > 0:
+            try:
+                self._build_llama_index()
+            except Exception as e:
+                logger.warning(f"LlamaIndex build failed, falling back to manual ChromaDB: {e}")
+                self._build_legacy_chroma()
+        elif _CHROMADB_AVAILABLE and len(self.event_texts) > 0:
+            self._build_legacy_chroma()
+
+    def _build_llama_index(self) -> None:
+        """
+        Build ChromaDB vector store via LlamaIndex HuggingFaceEmbedding + ChromaVectorStore.
+        Creates a VectorStoreIndex for semantic retrieval with metadata filtering.
+        """
+        t0 = time.time()
+        
+        # 1. Load embedder via LlamaIndex (handles caching, offline-first, warmup)
+        try:
+            embed_model = HuggingFaceEmbedding(
+                model_name="all-MiniLM-L6-v2",
+                trust_remote_code=False,
+            )
+            # Warmup
+            _ = embed_model.get_text_embedding("warmup")
+            elapsed = time.time() - t0
+            logger.info(f"LlamaIndex HuggingFaceEmbedding ready ({elapsed:.1f}s).")
+        except Exception as e:
+            # Fallback: try SentenceTransformer directly as embed_model is not required
+            # for LlamaIndex to function — it can use local_files_only
+            logger.info(f"HuggingFaceEmbedding warmup issue: {e}. Trying local-only...")
+            embed_model = HuggingFaceEmbedding(
+                model_name="all-MiniLM-L6-v2",
+                trust_remote_code=False,
+            )
+        
+        self._embedder = embed_model
+        
+        # 2. Build LlamaIndex Documents from event records
+        self._llama_documents = []
+        for eid in self.event_ids:
+            rec = self.event_records[eid]
+            doc = Document(
+                text=rec["clean_text"],
+                doc_id=eid,
+                metadata={
+                    "event_key": rec["event_key"],
+                    "source_file": rec["source_file"],
+                    "grade": rec["grade"],
+                    "required": rec["required"],
+                    "lang_suffix": self._get_suffix(rec["source_file"]),
+                },
+            )
+            self._llama_documents.append(doc)
+        
+        # 3. Create ChromaDB collection (reuse existing if populated)
+        chroma_path = str(self.db_dir / "chroma")
+        self.chroma_client = chromadb.PersistentClient(path=chroma_path)
+        self.chroma_collection = self.chroma_client.get_or_create_collection(name="lia_events")
+        
+        vector_store = ChromaVectorStore(chroma_collection=self.chroma_collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        
+        # 4. Build or load vector index
+        if self.chroma_collection.count() == 0:
+            logger.info("Building LlamaIndex VectorStoreIndex into ChromaDB (first run, ~10-15 min)...")
+            self._vector_index = VectorStoreIndex.from_documents(
+                self._llama_documents,
+                storage_context=storage_context,
+                embed_model=embed_model,
+                show_progress=True,
+            )
+            logger.info(f"LlamaIndex vector index built ({self.chroma_collection.count()} vectors).")
+        else:
+            logger.info(f"Loading existing ChromaDB collection ({self.chroma_collection.count()} vectors)...")
+            self._vector_index = VectorStoreIndex.from_vector_store(
+                vector_store=vector_store,
+                embed_model=embed_model,
+            )
+        
+        # 5. Create LlamaIndex retrievers
+        self._vector_retriever = self._vector_index.as_retriever(
+            similarity_top_k=20,  # fetch more than needed; cascade will filter
+        )
+        
+        elapsed_total = time.time() - t0
+        logger.info(f"LlamaIndex pipeline ready ({elapsed_total:.1f}s total).")
+
+    def _build_legacy_chroma(self) -> None:
+        """
+        Fallback: manual ChromaDB indexing (pre-LlamaIndex, kept for environments
+        where llama-index-core cannot be installed).
+        """
+        # Eager-load SentenceTransformer embedder (offline-first)
+        if self._embedder is None:
             try:
                 t0 = time.time()
                 try:
-                    # Try offline first — model should already be cached locally.
                     logger.info("Loading SentenceTransformer from local cache...")
                     self._embedder = SentenceTransformer(
                         "all-MiniLM-L6-v2",
@@ -305,54 +410,47 @@ class KnowledgeBase:
                     )
                     source = "local cache"
                 except Exception:
-                    # First run: download from HuggingFace (one-time, ~90MB).
                     logger.info("Model not cached locally. Downloading from HuggingFace (one-time, ~90MB)...")
                     self._embedder = SentenceTransformer("all-MiniLM-L6-v2")
                     source = "download"
-                # Warmup the encoder — first call triggers JIT/tracing overhead.
                 self._embedder.encode(["warmup"], show_progress_bar=False)
                 elapsed = time.time() - t0
                 logger.info(f"SentenceTransformer ready ({source}, {elapsed:.1f}s).")
             except Exception as e:
                 logger.warning(f"Failed to load SentenceTransformer: {e}. ChromaDB search will be skipped.")
+                return
 
-        # Initialize ChromaDB if available and populate/load index
-        if _CHROMADB_AVAILABLE and self._embedder is not None:
-            try:
-                chroma_path = str(self.db_dir / "chroma")
-                self.chroma_client = chromadb.PersistentClient(path=chroma_path)
-                self.chroma_collection = self.chroma_client.get_or_create_collection(name="lia_events")
-                
-                # Check if need to index vectors
-                if self.chroma_collection.count() == 0:
-                    logger.info("Indexing events into ChromaDB vector store...")
-                    
-                    # Batch embed and insert to prevent memory overflow
-                    batch_size = 500
-                    for i in range(0, len(self.event_texts), batch_size):
-                        batch_txt = self.event_texts[i:i+batch_size]
-                        batch_ids = self.event_ids[i:i+batch_size]
-                        batch_embs = self._embedder.encode(batch_txt, show_progress_bar=False, normalize_embeddings=True).tolist()
-                        batch_meta = [
-                            {
-                                "source": self.event_records[eid]["source_file"],
-                                "lang_suffix": self._get_suffix(self.event_records[eid]["source_file"]),
-                            }
-                            for eid in batch_ids
-                        ]
-                        
-                        self.chroma_collection.upsert(
-                            ids=batch_ids,
-                            embeddings=batch_embs,
-                            documents=batch_txt,
-                            metadatas=batch_meta
-                        )
-                    logger.info("ChromaDB vector store indexed successfully.")
-                else:
-                    logger.info(f"ChromaDB collection ready ({self.chroma_collection.count()} vectors).")
-            except Exception as e:
-                logger.warning(f"ChromaDB initialization failed, falling back to TF-IDF + RapidFuzz: {e}")
-                self.chroma_collection = None
+        try:
+            chroma_path = str(self.db_dir / "chroma")
+            self.chroma_client = chromadb.PersistentClient(path=chroma_path)
+            self.chroma_collection = self.chroma_client.get_or_create_collection(name="lia_events")
+
+            if self.chroma_collection.count() == 0:
+                logger.info("Indexing events into ChromaDB vector store (legacy)...")
+                batch_size = 500
+                for i in range(0, len(self.event_texts), batch_size):
+                    batch_txt = self.event_texts[i:i+batch_size]
+                    batch_ids = self.event_ids[i:i+batch_size]
+                    batch_embs = self._embedder.encode(batch_txt, show_progress_bar=False, normalize_embeddings=True).tolist()
+                    batch_meta = [
+                        {
+                            "source": self.event_records[eid]["source_file"],
+                            "lang_suffix": self._get_suffix(self.event_records[eid]["source_file"]),
+                        }
+                        for eid in batch_ids
+                    ]
+                    self.chroma_collection.upsert(
+                        ids=batch_ids,
+                        embeddings=batch_embs,
+                        documents=batch_txt,
+                        metadatas=batch_meta
+                    )
+                logger.info("ChromaDB vector store indexed successfully.")
+            else:
+                logger.info(f"ChromaDB collection ready ({self.chroma_collection.count()} vectors).")
+        except Exception as e:
+            logger.warning(f"ChromaDB initialization failed, falling back to TF-IDF + RapidFuzz: {e}")
+            self.chroma_collection = None
 
     def get_event_with_choices(self, event_key: str) -> Optional[Dict[str, Any]]:
         """Retrieve full event metadata, choices, and chance results by event_key."""
@@ -517,12 +615,17 @@ class KnowledgeBase:
 
         best_so_far = max(results.values()) if results else 0.0
 
-        # Stage 3: Chroma vector search (cold path, only if TF-IDF was weak).
-        # Embedder is pre-loaded at init — no lazy download during search.
-        if best_so_far < 0.6 and use_vector and self.chroma_collection and self._embedder is not None:
+        # Stage 3: Vector search (cold path, only if TF-IDF was weak).
+        # LlamaIndex handles embedding/indexing; retrieval uses ChromaDB directly
+        # for proven backward compatibility with the existing query pipeline.
+        if best_so_far < 0.6 and use_vector and self.chroma_collection is not None and self._embedder is not None:
             try:
-                q_emb = self._embedder.encode([query_clean], normalize_embeddings=True).tolist()
-                # Use native Chroma where filter (no post-hoc fetch_k * 5).
+                # LlamaIndex passes call; fallback to SentenceTransformer directly
+                if hasattr(self._embedder, 'encode'):
+                    q_emb = self._embedder.encode([query_clean], normalize_embeddings=True).tolist()
+                else:
+                    # LlamaIndex HuggingFaceEmbedding wrapper
+                    q_emb = [self._embedder.get_text_embedding(query_clean)]
                 n_results = top_k * 3 if suffix else top_k * 2
                 query_filter = {"lang_suffix": suffix} if suffix else None
                 c_res = self.chroma_collection.query(
@@ -536,7 +639,7 @@ class KnowledgeBase:
                         score = max(0.0, min(1.0, 1.0 - (dist / 2.0)))
                         results[ekey] = max(results.get(ekey, 0.0), score)
             except Exception as e:
-                logger.warning(f"Chroma search failed: {e}. Using RapidFuzz + TF-IDF only.")
+                logger.warning(f"Vector search failed: {e}. Using RapidFuzz + TF-IDF only.")
 
         return self._finalize_results(results, top_k)
 

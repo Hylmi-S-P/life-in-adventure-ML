@@ -2,6 +2,9 @@
 retriever.py - RAG Retriever for Life in Adventure.
 Retrieves and structures event dialogs, choices, stat requirements, items, and monsters
 from KnowledgeBase based on OCR screen text or user queries.
+
+Vector search backend: LlamaIndex VectorStoreIndex (when available) or legacy ChromaDB.
+Choice re-ranking: LlamaIndex NodePostprocessor (when available) or inline lexical boost.
 """
 
 import json
@@ -12,6 +15,43 @@ from src.rag.knowledge_base import KnowledgeBase
 from src.core.response_cache import ResponseCache
 
 logger = loguru.logger
+
+# Optional: LlamaIndex NodePostprocessor for choice-aware re-ranking
+try:
+    from llama_index.core.postprocessor import SimilarityPostprocessor
+    _LLAMA_PP_AVAILABLE = True
+except ImportError:
+    _LLAMA_PP_AVAILABLE = False
+
+
+class ChoiceAwarePostprocessor:
+    """
+    LlamaIndex-compatible NodePostprocessor that boosts event scores based on
+    choice text appearing literally in the OCR query. Equivalent to the inline
+    re-ranking logic in retrieve_for_ocr() — packaged as a standalone processor
+    for cleaner separation and potential LlamaIndex pipeline integration.
+    """
+    def __init__(self, kb: KnowledgeBase, ocr_text: str):
+        self.kb = kb
+        self.ocr_lower = ocr_text.lower()
+
+    def postprocess_nodes(self, nodes, query_bundle=None):
+        """Boost nodes whose choice text appears in the OCR query."""
+        for node in nodes:
+            ekey = node.node_id
+            full_ev = self.kb.get_event_with_choices(ekey)
+            if not full_ev:
+                continue
+            choice_hits = 0
+            for ch in full_ev.get("choices", []):
+                ch_txt = ch.get("text", "").strip().lower()
+                if ch_txt and len(ch_txt) >= 3:
+                    if ch_txt in self.ocr_lower or self.ocr_lower.find(ch_txt[:15]) != -1:
+                        choice_hits += 1
+            if choice_hits > 0:
+                boost = 0.18 + (choice_hits * 0.05)
+                node.score = min(1.0, (node.score or 0.0) + boost)
+        return sorted(nodes, key=lambda n: n.score or 0.0, reverse=True)
 
 
 class RAGRetriever:

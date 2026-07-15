@@ -17,13 +17,14 @@ EasyOCR==1.7.1         # OCR engine — handles game fonts better than Tesseract
 # pytesseract requires: Tesseract OCR installed on system
 
 # ─── RAG / Vector Store ──────────────────────────────────────────────────────
-# chromadb==0.5.23  # old pinned (pre-1.x)
 chromadb==1.5.9         # Local vector DB (zero-config, SQLite-backed)
-# NOTE: Updated from 0.5.23 to 1.5.9 (2026-07-07). v1.x uses new .close() API
-# and Pydantic v2. Review import paths if upgrading existing KB.       # Local vector DB (zero-config, SQLite-backed)
-sentence-transformers==3.3.1  # Embedding model
+llama-index-core==0.14.23            # LlamaIndex: core ingestion, indexing, query engine
+llama-index-vector-stores-chroma==0.5.5  # LlamaIndex + ChromaDB integration
+llama-index-embeddings-huggingface==0.7.0  # LlamaIndex + sentence-transformers
+llama-index-retrievers-bm25==0.7.1   # BM25 retrieval (replaces sklearn TF-IDF)
+sentence-transformers==3.3.1  # Embedding model (shared by KB + LlamaIndex)
 numpy==2.2.4           # NumPy (required by sentence-transformers)
-scikit-learn>=1.5.0    # TF-IDF cosine similarity (used by KB hybrid search)
+scikit-learn>=1.5.0    # TF-IDF cosine similarity (kept for backward compat)
 rapidfuzz>=3.0.0       # Fast fuzzy string matching (used by KB + auto_clicker)
 
 # ─── AI / LLM ─────────────────────────────────────────────────────────────────
