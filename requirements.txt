@@ -1,0 +1,75 @@
+# =============================================================================
+# Life in Adventure Tools — Python Dependencies
+# Python 3.11+
+# Install: pip install -r requirements.txt
+# =============================================================================
+
+# ─── Core ────────────────────────────────────────────────────────────────────
+# NOTE: Pin versions to known-working releases. Update periodically.
+
+# ─── Screen Capture ──────────────────────────────────────────────────────────
+mss>=10.0.0           # Fast cross-platform screenshot (BSD license)
+Pillow==11.2.0        # Image processing (PIL fork, PIL is abandonware)
+
+# ─── OCR ─────────────────────────────────────────────────────────────────────
+EasyOCR==1.7.1         # OCR engine — handles game fonts better than Tesseract
+# Alternative: pytesseract==0.3.10  # wrapper for Tesseract (if EasyOCR fails)
+# pytesseract requires: Tesseract OCR installed on system
+
+# ─── RAG / Vector Store ──────────────────────────────────────────────────────
+# chromadb==0.5.23  # old pinned (pre-1.x)
+chromadb==1.5.9         # Local vector DB (zero-config, SQLite-backed)
+# NOTE: Updated from 0.5.23 to 1.5.9 (2026-07-07). v1.x uses new .close() API
+# and Pydantic v2. Review import paths if upgrading existing KB.       # Local vector DB (zero-config, SQLite-backed)
+sentence-transformers==3.3.1  # Embedding model
+numpy==2.2.4           # NumPy (required by sentence-transformers)
+scikit-learn>=1.5.0    # TF-IDF cosine similarity (used by KB hybrid search)
+rapidfuzz>=3.0.0       # Fast fuzzy string matching (used by KB + auto_clicker)
+
+# ─── AI / LLM ─────────────────────────────────────────────────────────────────
+anthropic==0.42.0     # Anthropic API client (for Claude via ZCode)
+openai==1.59.0         # OpenAI API client (fallback)
+
+# ─── UI / Overlay ─────────────────────────────────────────────────────────────
+# NOTE: Choose ONE UI framework. customtkinter recommended for MVP.
+# If PyQt6 preferred, comment out customtkinter and uncomment PyQt6.
+customtkinter==5.2.2   # Modern tkinter fork with transparent window support
+# PyQt6==6.8.0         # More powerful but heavier
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+PyYAML==6.0.2          # YAML config file parsing
+
+# ─── Networking ──────────────────────────────────────────────────────────────
+httpx==0.28.1          # Async HTTP client (used by anthropic SDK)
+aiofiles==24.1.0       # Async file I/O
+tenacity==9.0.0         # Retry logic (for API calls)
+
+# ─── Window Management ───────────────────────────────────────────────────────
+pywin32==308           # Win32 API (window detection, screenshot on Windows)
+# NOTE: Only needed on Windows. On Linux use:
+#   pygetwindow==0.0.9  (Linux alternative)
+
+# ─── APK Extraction ───────────────────────────────────────────────────────────
+# NOTE: Install Java JDK (11+) separately — jadx requires JVM
+# pip packages for extraction script:
+requests==2.32.3       # HTTP download (APK download)
+beautifulsoup4==4.12.3  # HTML parsing (APKMirror scraping)
+lxml==5.3.0            # Fast XML/HTML parser (BS4 dependency)
+html5lib==1.1          # HTML5 parser (BS4 alternative)
+
+# ─── Development / Testing ───────────────────────────────────────────────────
+pytest==8.3.5          # Test framework
+pytest-asyncio==0.25.2 # Async test support
+pytest-cov==6.1.1      # Coverage reporting
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+cachetools==5.5.0       # LRU cache for ResponseCache (Ponytail mode -- REVIEW_REPORT M4)
+python-dotenv==1.0.1   # .env file support
+tqdm==4.67.1           # Progress bars
+loguru==0.7.3          # Better logging
+pydantic==2.10.6       # Data validation
+
+# ─── RL & Simulation ─────────────────────────────────────────────────────────
+gymnasium>=1.0.0       # OpenAI Gym / Gymnasium API for offline/parallel RL training
+torch>=2.0.0           # PyTorch for Q-learning and neural policy optimization
+

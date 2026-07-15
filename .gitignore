@@ -1,0 +1,139 @@
+# =============================================================================
+# Life in Adventure Tools — .gitignore
+# =============================================================================
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environment
+venv/
+env/
+.env
+.venv/
+
+# ─── Data (local, not versioned) ───────────────────────────────────────────────
+data/knowledge_base/
+data/raw_extracted/
+data/parsed/
+data/apk/
+data/session_history/
+data/lia_kb.sqlite
+data/discovered_paths.db
+data/ai_eval_cache.json
+data/rag_cache.json
+data/test_capture.png
+*.sqlite
+*.sqlite3
+chroma.sqlite
+
+# Downloaded APKs (too large, don't commit)
+*.apk
+*.xapk
+*.apkm
+*.apks
+
+# ChromaDB persists here
+.chroma/
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+
+# ─── Config (secrets) ─────────────────────────────────────────────────────────
+# Keep configs but NOT secrets
+# configs/default_config.yaml  ← DO version this (no secrets)
+# configs/*.yaml               ← DO version this
+secrets.yaml
+api_keys.yaml
+.env.local
+config.local.yaml
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.iml
+
+# ─── Testing ─────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ─── Temporary files ──────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.backup
+*.swp
+*.temp
+tmp/
+temp/
+
+# ─── Debug / Verification (not production) ────────────────────────────────────
+verify_*.py
+verify_*.png
+scratch_*.py
+scratch/
+*.scratch
+
+# ─── Tool-specific metadata (not source) ─────────────────────────────────────
+docs/.omo/
+docs/.reasonix/
+docs/reasonix.toml
+docs/session-*.md
+.zcode/
+
+# ─── Overlays / Windows ───────────────────────────────────────────────────────
+*.overlay
+
+# ─── Models (large files) ─────────────────────────────────────────────────────
+# EasyOCR model cache
+easyocr/
+# Sentence transformer cache
+sentence_transformers/
+# Huggingface cache
+.cache/
+models/
+
+# ─── APK Tools (large binaries) ───────────────────────────────────────────────
+jadx/
+apktool/
+tools/

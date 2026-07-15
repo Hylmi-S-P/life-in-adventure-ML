@@ -1,0 +1,99 @@
+# LifeInAdventure-Tools â€” Default Configuration
+# Copy to local_config.yaml and customize
+
+app:
+  name: "LiA Quest Assistant"
+  version: "1.0.0"
+  log_level: "INFO"
+  log_file: "logs/app.log"
+
+# â”€â”€â”€ Emulator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+emulator:
+  type: "ldplayer"  # mumuproplayer | bluestacks | ldplayer | android_studio | genymotion
+  capture_interval: 3.0    # seconds between screenshots
+  auto_detect: true       # auto-detect emulator window
+  window_title: null       # override window title (null = auto-detect)
+  capture_region: null     # (x, y, width, height) â€” null = full window
+
+# â”€â”€â”€ Overlay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+overlay:
+  position: "right"        # left | right | top | custom
+  custom_pos: null         # (x, y) â€” use if position is "custom"
+  width: 450
+  height: 650
+  opacity: 0.85            # 0.0 to 1.0
+  bg_color: "#1a1a2e"
+  text_color: "#e0e0e0"
+  accent_color: "#00d4ff"
+  font_size: 11
+  theme: "dark"            # dark | light | amoled
+
+  hotkeys:
+    toggle: "F9"
+    refresh_kb: "F10"
+    quit: "F12"
+    settings: "F11"
+
+# â”€â”€â”€ AI Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ai:
+  provider: "zcode"         # zcode | openai | ollama
+  model: "claude-opus-4-6"  # zcode: claude-opus-4-6 | openai: gpt-4o-mini | ollama: llama3.2
+  verbosity: "brief"        # brief | detailed | expert
+  temperature: 0.7
+  max_tokens: 1024
+
+  # ZCode config (default: uses ZCODE_API_KEY env var)
+  zcode:
+    base_url: "https://gateway.olagon.site/anthropic"  # Updated from api.z.ai — consistent with config.py + ARCHITECTURE.md
+
+  # OpenAI config (fill if provider is "openai")
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key: null           # or set OPENAI_API_KEY env var
+
+  # Ollama config (fill if provider is "ollama")
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "llama3.2"
+
+# â”€â”€â”€ RAG â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+rag:
+  # NOTE: canonical path is data/knowledge_base/lia_kb.sqlite (75MB).
+  # Other copies (stale): data/knowledge_base/events.db/ and data/lia_kb.sqlite/
+  # ChromaDB index at: data/knowledge_base/chroma/
+  db_path: "data/knowledge_base"
+  embedding_model: "all-MiniLM-L6-v2"
+  embedding_dim: 384
+  top_k_events: 3           # number of events to retrieve
+  top_k_choices: 5         # number of choices to retrieve
+  similarity_threshold: 0.6  # minimum similarity score (0.0-1.0)
+
+# â”€â”€â”€ Knowledge Base â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+knowledge_base:
+  version: "1.2.42"         # Update after APK extraction
+  source_apk_version: null
+  total_quests: 0           # Auto-populated after KB build
+  total_events: 0
+  total_choices: 0
+  total_epilogues: 0
+
+# â”€â”€â”€ Player Stats (optional â€” fill for more accurate recommendations) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+player:
+  stats:
+    str: null
+    dex: null
+    int: null
+    cha: null
+    con: null
+    wis: null
+  level: null
+  gold: null
+  alignment: null           # -100 to +100
+  background: null          # e.g. "bg_adventurer"
+
+# â”€â”€â”€ Capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+capture:
+  format: "PNG"
+  quality: 95
+  resize_factor: 1.0        # scale down for faster OCR (1.0 = full res)
+  preprocess: true           # apply image preprocessing
