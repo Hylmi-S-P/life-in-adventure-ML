@@ -60,8 +60,10 @@ class AIDecisionEngine:
         self._eval_cache = ResponseCache(maxsize=500, ttl=3600.0, persist_path="data/ai_eval_cache.json")
 
         # Load PPO checkpoint as low-confidence fallback (Phase P2.3).
+        # Prefers legacy ActorCritic .pt; falls back to SB3 .zip if present.
         self._ppo_model = None
         self._ppo_valid = False
+        self._ppo_backend = None  # "actor_critic" | "sb3"
         self._load_ppo_if_available()
 
     # ------------------------------------------------------------------ #
@@ -70,59 +72,69 @@ class AIDecisionEngine:
 
     def _load_ppo_if_available(self) -> None:
         """
-        Load the PPO Actor-Critic checkpoint if it exists and is compatible.
-        Instantiates ActorCritic, loads policy_state_dict, and validates shapes.
-        Sets self._ppo_model to the validated ActorCritic instance (or None on failure).
+        Load PPO for low-confidence fallback.
+        Priority: legacy ActorCritic .pt (ppo_curiosity_latest.pt) → SB3 .zip.
         """
+        if self._load_legacy_actor_critic():
+            return
+        self._load_sb3_model()
+
+    def _load_legacy_actor_critic(self) -> bool:
+        """Load custom ActorCritic from ppo_curiosity_latest.pt (epoch-50 checkpoint)."""
         ckpt_path = "data/models/ppo_curiosity_latest.pt"
         if not os.path.exists(ckpt_path):
-            return
+            return False
         try:
             import torch
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if not isinstance(ckpt, dict) or "policy_state_dict" not in ckpt:
+                logger.warning("PPO checkpoint: invalid structure, skipping.")
+                return False
 
-            # Validate checkpoint structure
-            if not isinstance(ckpt, dict):
-                logger.warning("PPO checkpoint: not a dict, skipping.")
-                return
-            if "policy_state_dict" not in ckpt:
-                logger.warning("PPO checkpoint: missing 'policy_state_dict', skipping.")
-                return
-
-            # Instantiate the same ActorCritic architecture used during training.
             from src.ai.ppo_trainer import ActorCritic
             policy = ActorCritic(obs_dim=20, action_dim=5, hidden_dim=128)
-
-            # Validate tensor shapes before loading
             policy_sd = ckpt["policy_state_dict"]
             model_sd = policy.state_dict()
             shape_ok = all(
                 policy_sd[k].shape == model_sd[k].shape
-                for k in policy_sd
-                if k in model_sd
+                for k in policy_sd if k in model_sd
             )
             if not shape_ok:
-                logger.warning(
-                    "PPO checkpoint: policy_state_dict shapes do not match "
-                    f"expected ActorCritic(obs_dim=20, action_dim=5). "
-                    "Check that checkpoint was trained with the same architecture."
-                )
-                return
+                logger.warning("PPO checkpoint: shape mismatch for ActorCritic.")
+                return False
 
             policy.load_state_dict(policy_sd)
-            policy.eval()  # inference mode — disables dropout/batchnorm
+            policy.eval()
             self._ppo_model = policy
             self._ppo_valid = True
-            epoch = ckpt.get("epoch", "?")
-            discoveries = ckpt.get("total_discoveries", "?")
+            self._ppo_backend = "actor_critic"
             logger.info(
-                f"PPO Actor-Critic loaded (epoch={epoch}, discoveries={discoveries}). "
-                f"Valid inference: obs_dim=20, action_dim=5."
+                f"PPO Actor-Critic loaded (epoch={ckpt.get('epoch', '?')}, "
+                f"discoveries={ckpt.get('total_discoveries', '?')})."
             )
+            return True
         except Exception as e:
-            logger.warning(f"Could not load PPO checkpoint: {e}")
-            self._ppo_model = None
-            self._ppo_valid = False
+            logger.warning(f"Could not load legacy PPO checkpoint: {e}")
+            return False
+
+    def _load_sb3_model(self) -> bool:
+        """Load Stable-Baselines3 PPO zip if present (new training path)."""
+        for path in ("data/models/ppo_sb3_latest.zip", "data/models/ppo_sb3_latest"):
+            zip_path = path if path.endswith(".zip") else f"{path}.zip"
+            if not os.path.exists(zip_path) and not os.path.exists(path):
+                continue
+            try:
+                from stable_baselines3 import PPO
+                load_target = path if os.path.exists(path) else zip_path.replace(".zip", "")
+                model = PPO.load(load_target, device="cpu")
+                self._ppo_model = model
+                self._ppo_valid = True
+                self._ppo_backend = "sb3"
+                logger.info(f"SB3 PPO loaded from {load_target}.")
+                return True
+            except Exception as e:
+                logger.warning(f"Could not load SB3 PPO from {path}: {e}")
+        return False
 
     def _get_ppo_observation_vector(
         self,
@@ -222,33 +234,42 @@ class AIDecisionEngine:
         evaluations: List[Dict[str, Any]],
     ) -> int:
         """
-        Run the PPO Actor-Critic forward pass and return a visible (reindexed)
-        choice index with action masking applied.
-
-        Only returns an index in range [0, len(evaluations)-1].
-        Returns the heuristic best index on any error.
+        PPO forward pass with action masking. Supports ActorCritic (.pt) and SB3.
+        Returns index in [0, len(evaluations)-1], or heuristic best on error.
         """
         import torch
         from torch.distributions.categorical import Categorical
 
+        num_visible = len(evaluations)
+        if num_visible <= 0:
+            return 0
+
         try:
+            if self._ppo_backend == "sb3":
+                import numpy as np
+                obs_np = obs_vector.detach().cpu().numpy().astype(np.float32)
+                if obs_np.ndim == 1:
+                    obs_np = obs_np.reshape(1, -1)
+                action, _ = self._ppo_model.predict(obs_np, deterministic=False)
+                ppo_action = int(action[0] if hasattr(action, "__len__") else action)
+                ppo_action = max(0, min(ppo_action, num_visible - 1))
+                logger.info(
+                    f"SB3 PPO fallback: action {ppo_action} (num_visible={num_visible})"
+                )
+                return ppo_action
+
+            # Legacy ActorCritic path
             with torch.no_grad():
                 features = self._ppo_model.backbone(obs_vector)
-                logits = self._ppo_model.actor(features)  # shape (5,)
+                logits = self._ppo_model.actor(features)
 
-            num_visible = len(evaluations)
-            # Mask: set logits for unavailable actions (>= num_visible) to -inf
             mask = torch.full_like(logits, float("-inf"))
             mask[:num_visible] = 0.0
-            masked_logits = logits + mask
-
-            dist = Categorical(logits=masked_logits)
+            dist = Categorical(logits=logits + mask)
             ppo_action = int(dist.sample().item())
-            ppo_prob = float(dist.probs[ppo_action].item())
-
             logger.info(
                 f"PPO fallback: selected action {ppo_action} "
-                f"(prob={ppo_prob:.3f}, num_visible={num_visible})"
+                f"(prob={float(dist.probs[ppo_action].item()):.3f}, num_visible={num_visible})"
             )
             return ppo_action
         except Exception as e:

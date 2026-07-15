@@ -72,5 +72,7 @@ pydantic==2.10.6       # Data validation
 
 # ─── RL & Simulation ─────────────────────────────────────────────────────────
 gymnasium>=1.0.0       # OpenAI Gym / Gymnasium API for offline/parallel RL training
-torch>=2.0.0           # PyTorch for Q-learning and neural policy optimization
+torch>=2.0.0           # PyTorch for ActorCritic inference (legacy checkpoint)
+stable-baselines3>=2.4.0  # PPO training (replaces custom ppo_trainer loop)
+tensorboard>=2.18.0    # SB3 training metrics
 

@@ -8,9 +8,20 @@ try:
 except ImportError:
     LifeInAdventureEnv = None
 try:
-    from src.ai.vector_env import ParallelAdventureEnv
+    from src.ai.curiosity_env import ParallelCuriosityEnv, make_parallel_curiosity_env
+    ParallelAdventureEnv = ParallelCuriosityEnv
 except ImportError:
     ParallelAdventureEnv = None
+    ParallelCuriosityEnv = None
+    make_parallel_curiosity_env = None
+try:
+    from src.ai.rl_trainer import RLTrainer
+except ImportError:
+    RLTrainer = None
+try:
+    from src.ai.ppo_trainer import ActorCritic
+except ImportError:
+    ActorCritic = None
 
 __all__ = [
     "AIDecisionEngine",
@@ -19,4 +30,8 @@ __all__ = [
     "LifeInAdventureSimulator",
     "LifeInAdventureEnv",
     "ParallelAdventureEnv",
+    "ParallelCuriosityEnv",
+    "make_parallel_curiosity_env",
+    "RLTrainer",
+    "ActorCritic",
 ]
