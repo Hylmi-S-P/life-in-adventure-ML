@@ -299,209 +299,89 @@ class TextNormalizer:
 
 ### 3.3 RAG Module (`src/rag/`)
 
+Hybrid cascade (implemented): **RapidFuzz → TF-IDF → Chroma vector**.
+Indexing lifecycle: **LlamaIndex** (`HuggingFaceEmbedding` + `ChromaVectorStore`).
+Structured store: **SQLite** (`events`, `choices`, `items`, `monsters`).
+
 #### `knowledge_base.py`
 
 ```python
 class KnowledgeBase:
     """
-    ChromaDB-backed RAG knowledge base for Life in Adventure.
+    Offline RAG store: SQLite + cascade search + LlamaIndex/Chroma vectors.
     """
 
-    def __init__(self, db_path: str = "data/knowledge_base"):
-        self.client = chromadb.PersistentClient(path=db_path)
-        self.collection_quests = self.client.get_collection("quests")
-        self.collection_events = self.client.get_collection("events")
-        self.collection_choices = self.client.get_collection("choices")
-        self.collection_epilogues = self.client.get_collection("epilogues")
+    def __init__(self, db_path: str = "data/knowledge_base", source_dir: str = "data/apk/assets_dump"):
+        ...
 
-    def query(
-        self,
-        query_text: str,
-        n_results: int = 3,
-        collection: str = "events"
-    ) -> QueryResult:
-        """
-        Semantic search against knowledge base.
-        """
+    def get_version(self) -> str: ...
+    def get_event_with_choices(self, event_key: str) -> dict | None: ...
+    def search_events(
+        self, query: str, top_k: int = 5, use_vector: bool = True, language: str | None = None
+    ) -> list[tuple[dict, float]]:
+        """Cascade: RapidFuzz (early exit ≥0.88) → TF-IDF → Chroma (if best < 0.6)."""
 
-    def add_quest(self, quest: Quest) -> None:
-        """Add a quest to the knowledge base."""
-
-    def add_event(self, event: Event) -> None:
-        """Add an event to the knowledge base."""
-
-    def get_quest_by_id(self, quest_id: str) -> Quest | None:
-        """Retrieve full quest by ID."""
-
-    def get_event_chain(self, event_id: str) -> list[Event]:
-        """Get all events in a quest chain."""
-
-    def get_version(self) -> str:
-        """Return KB version (matches game version)."""
-
-    def build_from_parsed_data(self, data_dir: str) -> BuildReport:
-        """
-        Build entire KB from parsed game JSON files.
-        Returns build report with counts and stats.
-        """
-```
-
-#### `embedder.py`
-
-```python
-class Embedder:
-    """
-    Sentence transformer embedding generator.
-    """
-
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """
-        all-MiniLM-L6-v2: 384-dim, fast, CPU-friendly
-        Alternatives: "all-mpnet-base-v2" (768-dim, more accurate)
-        """
-        self.model = SentenceTransformer(model_name)
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings for a list of texts."""
-
-    def embed_quest(self, quest: Quest) -> list[str]:
-        """Generate searchable text representations of a quest."""
+    def get_item_by_id(self, item_id: int) -> dict | None: ...
+    def get_item_by_name(self, name: str) -> dict | None: ...
+    def get_monster_by_name(self, name: str) -> dict | None: ...
+    def close(self) -> None: ...
 ```
 
 #### `retriever.py`
 
 ```python
 class RAGRetriever:
-    """
-    High-level RAG retrieval with reranking.
-    """
+    """OCR → KB match → choice filter → ResponseCache."""
 
-    def __init__(
+    def retrieve_for_ocr(
         self,
-        knowledge_base: KnowledgeBase,
-        embedder: Embedder,
-        reranker_model: str | None = None
-    ):
-        self.kb = knowledge_base
-        self.embedder = embedder
-        self.reranker = CrossEncoder(reranker_model) if reranker_model else None
-
-    def retrieve_for_game_state(
-        self,
-        quest_text: str,
-        choices: list[str],
-        player_stats: dict | None = None
-    ) -> GameStateContext:
+        ocr_text: str,
+        use_vector: bool = True,
+        language: str | None = None,
+        player_stats: dict | None = None,
+        player_inventory: list[str] | None = None,
+    ) -> dict:
         """
-        Main retrieval method. Given current game state:
-        1. Find matching events in KB
-        2. Extract relevant choices and outcomes
-        3. Factor in player stats if provided
-        4. Return structured GameStateContext for AI engine
-
         Returns:
-            GameStateContext with:
-            - matched_quest: Quest | None
-            - matched_events: list[Event]
-            - relevant_choices: list[ChoiceWithOutcome]
-            - stat_recommendations: dict[str, int]
+          matched, confidence, event, event_full, choices, candidates
         """
 ```
 
 ### 3.4 AI Decision Engine (`src/ai/`)
 
-#### `decision_engine.py`
+#### Live path (`decision_engine.py`)
 
 ```python
-SYSTEM_PROMPT = """You are an expert Life in Adventure game assistant.
-The player is playing a text-based D&D-style RPG. You have a RAG knowledge base
-with quest data, choice outcomes, stat requirements, and epilogue conditions.
-
-For every response, follow this structure:
-1. **Quest**: Identify what quest/event is happening
-2. **Analysis**: Briefly explain each choice and its likely outcomes
-3. **Recommendation**: State the best choice with clear reasoning
-4. **Risk Warning**: Mention if any choice could lead to bad outcomes
-5. **Tip**: Optional tactical tip based on stats or game state
-
-Be concise (MVP). Max 3 sentences per choice analysis.
-If uncertain, say "Not enough data — your call!" rather than guessing.
-
-Game stats: STR (Strength), DEX (Dexterity), INT (Intelligence),
-CHA (Charisma), CON (Constitution), WIS (Wisdom).
-Stats range from 1-27 (Super X+2 unlock at 27; Super X+1 at 18).
-Stat modifier: (stat - 10) // 2, rounded down.
-Combat uses D20 roll + stat_modifier + Power Points (from equipment).
-Social checks use CHA or WIS.
-Trap detection uses DEX.
-Spellcasting uses INT.
-
-EXP MANAGEMENT RULE (CRITICAL):
-- EXP max = 100. When bar fills, adventure ends (epilogue triggered).
-- Each choice has exp_cost: 0 (non-progressing) or positive (gives EXP).
-- Player strategy may be "EXP fasting" — actively avoiding EXP to gain
-  stat levels at merchants/random events before ending trigger.
-- Bila player's current_exp in OCR > 80 AND target_epilogue not yet unlocked,
-  set risk_level="critical" and recommend Choice.exp_cost=0 first.
-- Always display exp_delta per choice in choice_analysis output.
-
-ALIGNMENT MODEL (CRITICAL):
-- Game uses 5 discrete tiers: Good / Moral / Neutral / Impure / Evil.
-- Trait-driven shifts: Bright +20, Dark -20, Innately Good/Evil +/-20, Savior/Butcher +/-20.
-- Do NOT model as linear -100..+100 gauge; tier threshold inferred
-  from trait deltas (Good >= 60, Moral 20-59, Neutral -19..19, Impure -60..-20, Evil <= -60).
-"""
-
 class AIDecisionEngine:
     """
-    ZCode/Claude API wrapper for AI recommendations.
+    Offline-first recommendations:
+    1. HeuristicPolicy.evaluate_choice() for every option
+    2. If low confidence (pass_prob < 0.55 OR score margin < 5):
+       PPO fallback (ActorCritic .pt preferred, else SB3 .zip)
     """
 
-    def __init__(
-        self,
-        provider: str = "zcode",  # "zcode" | "openai" | "ollama"
-        model: str = "claude-opus-4-6",
-        api_key: str | None = None,
-        base_url: str | None = None,
-        verbosity: str = "brief"
-    ):
-        self.provider = provider
-        self.model = model
-        self.verbosity = verbosity
-        self.client = self._init_client(provider, api_key, base_url)
-
-    def _init_client(self, provider, api_key, base_url) -> Any:
-        """Initialize API client based on provider."""
-
-    def get_recommendation(
-        self,
-        context: GameStateContext,
-        player_stats: dict[str, int] | None = None
-    ) -> AIRecommendation:
+    def recommend_choice(self, retrieved_event: dict, player_state: dict | None = None) -> dict:
         """
-        Generate AI recommendation for current game state.
-
-        Args:
-            context: RAG retrieval result (quest, choices, outcomes)
-            player_stats: Player's current stats (optional, improves accuracy)
-
         Returns:
-            AIRecommendation with:
-            - quest_identified: str
-            - choice_analysis: list[ChoiceAnalysis]
-            - recommendation: str (choice ID)
-            - reasoning: str
-            - risk_level: "safe" | "moderate" | "risky"
-            - raw_response: str (full AI text)
+          recommended_choice_idx, recommended_choice_text, confidence,
+          reasoning, choice_evaluations, _decision_source
         """
-
-    def _build_prompt(
-        self,
-        context: GameStateContext,
-        player_stats: dict | None
-    ) -> str:
-        """Build prompt from game state context."""
 ```
+
+#### RL training (`rl_trainer.py`)
+
+```python
+# Train (offline exploration / path discovery)
+from src.ai.rl_trainer import RLTrainer
+trainer = RLTrainer(num_envs=8)
+trainer.train(total_timesteps=100_000)
+trainer.save("data/models/ppo_sb3_latest")
+
+# Env: CuriosityAdventureEnv (Gymnasium, 20-dim obs, Discrete(5))
+# Parallel: stable_baselines3.common.vec_env.DummyVecEnv
+```
+
+Legacy inference network: `src/ai/ppo_trainer.ActorCritic` loads `data/models/ppo_curiosity_latest.pt`.
 
 ### 3.5 Overlay UI (`src/ui/`)
 

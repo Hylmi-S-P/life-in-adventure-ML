@@ -1,9 +1,10 @@
 # Handover Note — LifeInAdventure-Tools
 
 **Project**: AI Quest Assistant for Life in Adventure
-**Session**: 2026-07-05
-**Author**: Claude (via ZCode/Ollagon Gateway)
-**Status**: ✅ Documentation Complete — Ready for Implementation
+**Session**: 2026-07-16 (framework migration)
+**Author**: ZCode (Claude Opus / Hylmi)
+**Status**: ✅ Phase 0–3 framework migration complete (LlamaIndex RAG + SB3 RL)
+**Repo**: https://github.com/Hylmi-S-P/life-in-adventure-ML
 
 ---
 

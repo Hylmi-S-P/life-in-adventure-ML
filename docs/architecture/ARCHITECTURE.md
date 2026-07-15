@@ -2,13 +2,17 @@
 
 > Detailed technical architecture for LifeInAdventure-Tools.
 > 
+> **v1.2** (2026-07-16): Framework migration notes:
+> - RAG: LlamaIndex indexes embeddings into Chroma; retrieval cascade remains RapidFuzz → TF-IDF → Chroma
+> - RL: Stable-Baselines3 PPO for training (`rl_trainer.py`); live PPO fallback still uses ActorCritic `.pt` or SB3 `.zip`
+> 
 > **v1.1** (2026-07-06): Patches per `docs/review/REVIEW_REPORT.md`:
 > - M6: ZCode base_url align dengan SPEC/API_CONTRACT (`gateway.olagon.site`)
 > - I4: EventBus interface sketch code added (§1.2)
 > - I2: Capture optimizations + adaptive interval callout
 > - C5: IL2CPP risk acknowledgement (§7.1)
 > 
-> Read [SPEC.md](../SPEC.md) for high-level overview first.
+> Read [SPEC.md](../../SPEC.md) for high-level overview first.
 
 ---
 
@@ -50,16 +54,17 @@
 ┌────────────────────────────────┼──────────────────────────────────────────┐
 │                              DATA LAYER                                    │
 │  ┌────────────────┐  ┌────────────────────┐  ┌─────────────────────────┐   │
-│  │   ChromaDB     │  │   Parsed JSON      │  │   Configuration         │   │
-│  │   Knowledge    │  │   Game Data        │  │   (YAML)               │   │
-│  │   Base         │  │                    │  │                         │   │
+│  │ SQLite + Chroma│  │   Parsed JSON      │  │   Configuration         │   │
+│  │ (LlamaIndex    │  │   Game Data        │  │   (YAML)               │   │
+│  │  embed/index)  │  │                    │  │                         │   │
 │  └───────┬────────┘  └─────────┬──────────┘  └─────────────────────────┘   │
 │          │                      │                                          │
 │          ▼                      ▼                                          │
 │  ┌─────────────────────────────────────────────────────────────────────┐ │
 │  │                  APK EXTRACTION PIPELINE                              │ │
-│  │  APK → jadx decompile → Asset extraction → JSON parser → ChromaDB    │ │
+│  │  APK → jadx → assets_dump JSON → SQLite ingest → LlamaIndex/Chroma  │ │
 │  └─────────────────────────────────────────────────────────────────────┘ │
+│  Offline RL: CuriosityAdventureEnv → SB3 DummyVecEnv → PPO (rl_trainer)  │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 

@@ -57,13 +57,15 @@ This tool is an **overlay assistant** that:
 | Layer | Technology | Why |
 |-------|------------|-----|
 | **Language** | Python 3.11+ | Mature ML/OCR ecosystem |
-| **Screen Capture** | `mss` | Fast, cross-platform |
-| **OCR** | `EasyOCR` | Better on pixel-art game fonts. Multilingual support (KR/ID/ES/IT/PT) pending per-language ChromaDB collections (REVIEW_REPORT L1) |
-| **Vector Store** | `ChromaDB` | Local-first, zero-config |
-| **Embedding** | `sentence-transformers` | CPU-capable, good quality |
-| **AI Engine** | ZCode API (Claude) via Ollagon gateway -> OpenAI (GPT-4o-mini) -> Ollama (llama3.2 local) fallback | Abstracted providers with nested config (config.py ZCodeConfig/OpenAIConfig/OllamaConfig) |
-| **Overlay UI** | `customtkinter` | Native feel, transparent windows |
-| **APK Extraction** | `jadx` + `apktool` + `il2cppdumper` | Pre-flight check required (C5): verify IL2CPP vs Mono before Phase 1. See `docs/data/DATA_EXTRACTION_FORENSICS.md` |
+| **Screen Capture** | `mss` + `pywin32` | Fast window capture; absolute screen coords for clicks |
+| **OCR** | `EasyOCR` | Pixel-art fonts; KO/EN ROI crop; single-pass extract |
+| **RAG / Vector** | `LlamaIndex` + `ChromaDB` + RapidFuzz + TF-IDF | Cascade hybrid search; LlamaIndex manages embed/index lifecycle |
+| **Embedding** | `sentence-transformers` via LlamaIndex `HuggingFaceEmbedding` | `all-MiniLM-L6-v2`, CPU-friendly |
+| **Decision** | HeuristicPolicy + PPO fallback | Offline scoring; low-confidence uses ActorCritic `.pt` or SB3 `.zip` |
+| **RL Training** | `stable-baselines3` PPO | Replaces custom training loop; Gymnasium env + DummyVecEnv |
+| **AI LLM (optional)** | ZCode / OpenAI / Ollama | Cloud or local narrative assist |
+| **Overlay UI** | `customtkinter` | Always-on-top transparent panel |
+| **APK Extraction** | `jadx` + asset JSON dump | Offline KB from game data |
 
 ---
 
@@ -71,28 +73,18 @@ This tool is an **overlay assistant** that:
 
 ```
 LifeInAdventure-Tools/
-├── docs/                          # All documentation
-│   ├── prd/                       # Product Requirements
-│   ├── architecture/              # System architecture
-│   ├── setup/                     # Setup guides
-│   ├── data/                     # Data schemas
-│   └── api/                      # API contracts
-├── src/                          # Source code
-│   ├── capture/                  # Screen capture module
-│   ├── ocr/                      # OCR processing
-│   ├── rag/                      # RAG knowledge base
-│   ├── ai/                       # AI decision engine
-│   └── ui/                       # Overlay UI
-├── scripts/                      # Utility scripts
-│   ├── extract_apk.py           # APK extraction pipeline
-│   ├── first_time_setup.py      # Initial KB build
-│   └── setup_env.py             # Environment setup
-├── data/                        # Runtime data
-│   ├── knowledge_base/          # ChromaDB persist
-│   ├── raw_extracted/           # Raw APK data
-│   └── parsed/                  # Structured JSON
-├── configs/                     # Configuration files
-├── tests/                       # Test suite
+├── docs/                    # PRD, architecture, schema, setup
+├── src/
+│   ├── capture/             # Screen capture, auto-clicker, session logger
+│   ├── ocr/                 # EasyOCR + normalizer
+│   ├── rag/                 # KnowledgeBase (LlamaIndex+Chroma) + RAGRetriever
+│   ├── ai/                  # Decision engine, HeuristicPolicy, RLTrainer (SB3)
+│   ├── core/                # Thread-safe state, cache, metrics, dedup
+│   ├── ui/                  # Overlay, stats, settings, feedback
+│   └── data_extraction/     # APK asset extract
+├── configs/default_config.yaml
+├── tests/                   # e2e + session logger (17 tests)
+├── data/                    # Local only (gitignored): KB, models, sessions
 ├── README.md
 ├── SPEC.md
 ├── requirements.txt
@@ -113,15 +105,15 @@ LifeInAdventure-Tools/
 ### 1. Clone & Setup Environment
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/LifeInAdventure-Tools.git
-cd LifeInAdventure-Tools
+git clone https://github.com/Hylmi-S-P/life-in-adventure-ML.git
+cd life-in-adventure-ML
 
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+# Windows:
+venv\Scripts\activate
+# Linux/macOS:
+# source venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
