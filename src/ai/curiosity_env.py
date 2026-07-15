@@ -156,8 +156,14 @@ class ParallelCuriosityEnv:
 
     def reset(self, seeds: Optional[List[int]] = None):
         if self._sb3_vec is not None:
-            obs = self._sb3_vec.reset()
-            return obs, [{} for _ in range(self.num_envs)]
+            # SB3 DummyVecEnv.reset() → (obs, infos) in recent versions; older → obs only
+            out = self._sb3_vec.reset()
+            if isinstance(out, tuple) and len(out) == 2:
+                obs, infos = out
+                if not isinstance(infos, list):
+                    infos = [infos] * self.num_envs
+                return obs, infos
+            return out, [{} for _ in range(self.num_envs)]
         obs_list, info_list = [], []
         for i, env in enumerate(self.envs):
             seed = seeds[i] if seeds and i < len(seeds) else None

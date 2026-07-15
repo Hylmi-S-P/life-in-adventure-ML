@@ -108,13 +108,13 @@ class RAGConfig:
 
 @dataclass
 class PlayerConfig:
-    """Player stats (maps from YAML player.stats.*)."""
-    strength: int | None = None
-    dex: int | None = None
-    intelligence: int | None = None
-    cha: int | None = None
-    con: int | None = None
-    wis: int | None = None
+    """Player stats (YAML player.stats.*). Short keys match simulator/policy/OCR."""
+    str: Optional[int] = None  # noqa: A003 — game stat name
+    dex: Optional[int] = None
+    int: Optional[int] = None  # noqa: A003 — game stat name
+    cha: Optional[int] = None
+    con: Optional[int] = None
+    wis: Optional[int] = None
 
 
 @dataclass
@@ -157,11 +157,21 @@ class Config:
         if "stats" in player_data and isinstance(player_data["stats"], dict):
             player_stats = dict(player_data.pop("stats"))
             player_data.update(player_stats)
-        # Normalize YAML shorthand keys to PlayerConfig field names.
-        _stat_alias = {"str": "strength"}
-        for yaml_key, cfg_key in _stat_alias.items():
-            if yaml_key in player_data and cfg_key not in player_data:
-                player_data[cfg_key] = player_data.pop(yaml_key)
+        # Keep short keys (str/dex/int/...) — matches simulator, policy, OCR.
+        # Also accept long forms from older YAML and map to short.
+        _stat_alias = {
+            "strength": "str",
+            "intelligence": "int",
+            "dexterity": "dex",
+            "charisma": "cha",
+            "constitution": "con",
+            "wisdom": "wis",
+        }
+        for yaml_key, short_key in _stat_alias.items():
+            if yaml_key in player_data and short_key not in player_data:
+                player_data[short_key] = player_data.pop(yaml_key)
+            elif yaml_key in player_data:
+                player_data.pop(yaml_key)
 
         # AI config: resolve nested provider configs into dataclass instances
         ai_data = data.get("ai", {})
@@ -190,26 +200,27 @@ class Config:
         return result
 
     def _normalize_capture_region(self) -> None:
-        """Normalize capture_region from YAML list to tuple."""
+        """Normalize capture_region from YAML list to tuple of 4 ints (or None)."""
         region = getattr(self.emulator, "capture_region", None)
-        if region is not None and isinstance(region, (list, tuple)) and len(region) == 4:
+        if region is None:
+            return
+        if isinstance(region, (list, tuple)) and len(region) == 4:
             try:
                 self.emulator.capture_region = tuple(int(v) for v in region)
             except (ValueError, TypeError):
                 self.emulator.capture_region = None
+        else:
+            self.emulator.capture_region = None
 
     def to_yaml(self, path: Path) -> None:
         """Save config to YAML file."""
         player_dict = self.player.__dict__.copy()
-        # Un-nest stats back under player.stats for YAML compatibility
-        # and convert field names to YAML shorthand (strength → str)
-        stat_alias = {"strength": "str"}
-        stat_keys = {"strength", "dex", "intelligence", "cha", "con", "wis"}
+        # Short keys are already the canonical names now (str/dex/int/...)
+        stat_keys = {"str", "dex", "int", "cha", "con", "wis"}
         player_stats = {}
         for k in list(player_dict.keys()):
             if k in stat_keys:
-                yaml_key = stat_alias.get(k, k)
-                player_stats[yaml_key] = player_dict.pop(k)
+                player_stats[k] = player_dict.pop(k)
         player_data = {**player_dict, "stats": player_stats} if player_stats else player_dict
 
         data = {
@@ -245,8 +256,8 @@ class Config:
             if ci is not None and ci > 10.0:
                 issues.append(f"capture_interval={ci}s is very slow (> 10s)")
 
-        # Player stats: PlayerConfig fields are strength, dex, intelligence, cha, con, wis
-        stat_keys = {"strength", "dex", "intelligence", "cha", "con", "wis"}
+        # Player stats: short keys str/dex/int/cha/con/wis
+        stat_keys = {"str", "dex", "int", "cha", "con", "wis"}
         for stat, val in vars(self.player).items():
             if stat in stat_keys and val is not None and not isinstance(val, (int, float)):
                 issues.append(f"Player stat '{stat}' should be numeric, got {type(val).__name__}: {val}")

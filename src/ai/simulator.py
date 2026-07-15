@@ -100,16 +100,43 @@ class LifeInAdventureSimulator:
             "step": self.turn_step
         }
 
+    def _resolve_next_event_key(self, stem: str, event_id: int) -> Optional[str]:
+        """
+        Map game nextEvent id to real SQLite event_key (stem_id_idx).
+        Prefer exact stem_id_id, else first matching id under source_file.
+        """
+        candidate = f"{stem}_{event_id}_{event_id}"
+        if self.kb and self.kb.get_event_by_key(candidate):
+            return candidate
+        if not self.kb or not getattr(self.kb, "conn", None):
+            return candidate
+        try:
+            cur = self.kb.conn.cursor()
+            cur.execute(
+                "SELECT event_key FROM events WHERE source_file = ? AND id = ? LIMIT 1",
+                (stem, event_id),
+            )
+            row = cur.fetchone()
+            if row:
+                return row["event_key"] if hasattr(row, "keys") else row[0]
+        except Exception as e:
+            logger.debug(f"next_event resolve failed: {e}")
+        return candidate
+
     def _eval_stat_check(self, req_code: str) -> bool:
         """
         Evaluate a D20 check string like '0_2_12' (STR check DC 12).
-        Returns True if passed, False otherwise.
+        '|' separates OR alternatives — pass if any alternative succeeds.
         """
         if not req_code or req_code == "0":
             return True
 
         stat_map = {0: "str", 1: "dex", 2: "int", 3: "cha", 4: "con", 5: "wis"}
-        parts = req_code.split("|")
+        parts = [p for p in req_code.split("|") if p.strip()]
+        if not parts:
+            return True
+
+        any_evaluable = False
         for p in parts:
             tokens = p.split("_")
             if len(tokens) >= 3:
@@ -119,13 +146,13 @@ class LifeInAdventureSimulator:
                     stat_name = stat_map.get(stat_id, "str")
                     mod = self.player.get_stat_modifier(stat_name)
                     roll = random.randint(1, 20)
+                    any_evaluable = True
                     if roll + mod >= dc:
-                        return True
-                    else:
-                        return False
+                        return True  # OR: any success wins
                 except ValueError:
                     continue
-        return True
+        # All evaluable alternatives failed, or nothing evaluable → free pass
+        return not any_evaluable
 
     def _apply_results(self, results: List[Dict[str, Any]]) -> Tuple[float, Optional[str]]:
         """
@@ -174,17 +201,19 @@ class LifeInAdventureSimulator:
                     elif next_ev_val == -2 or next_ev_val == -1:
                         next_event_key = None  # End of node / map transition
                     else:
-                        # Jump to next event ID in same source file if possible
+                        # Resolve real event_key: stem_id_idx (idx may != id)
                         if self.current_event and self.current_event.get("source_file"):
                             stem = self.current_event["source_file"]
-                            # Try constructing expected key or searching by ID
-                            next_event_key = f"{stem}_{next_ev_val}_{next_ev_val}"
+                            next_event_key = self._resolve_next_event_key(stem, next_ev_val)
                 elif isinstance(next_ev_val, str):
                     next_event_key = next_ev_val
 
-        if self.player.hp <= 0:
+        # Death by HP only if not already penalized via nextEvent=-3
+        if self.player.hp <= 0 and self.player.alive:
             self.player.alive = False
             reward -= 15.0
+        elif self.player.hp <= 0:
+            self.player.alive = False
 
         return reward, next_event_key
 

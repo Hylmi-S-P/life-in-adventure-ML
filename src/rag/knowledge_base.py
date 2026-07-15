@@ -616,27 +616,39 @@ class KnowledgeBase:
         best_so_far = max(results.values()) if results else 0.0
 
         # Stage 3: Vector search (cold path, only if TF-IDF was weak).
-        # LlamaIndex handles embedding/indexing; retrieval uses ChromaDB directly
-        # for proven backward compatibility with the existing query pipeline.
+        # LlamaIndex handles embedding/indexing; retrieval uses ChromaDB directly.
+        # Note: older Chroma indices may only have metadata "source" (no lang_suffix).
+        # Prefer where=lang_suffix when present; always post-filter by language.
         if best_so_far < 0.6 and use_vector and self.chroma_collection is not None and self._embedder is not None:
             try:
-                # LlamaIndex passes call; fallback to SentenceTransformer directly
-                if hasattr(self._embedder, 'encode'):
-                    q_emb = self._embedder.encode([query_clean], normalize_embeddings=True).tolist()
+                if hasattr(self._embedder, "encode"):
+                    q_emb = self._embedder.encode(
+                        [query_clean], normalize_embeddings=True
+                    ).tolist()
                 else:
-                    # LlamaIndex HuggingFaceEmbedding wrapper
                     q_emb = [self._embedder.get_text_embedding(query_clean)]
-                n_results = top_k * 3 if suffix else top_k * 2
+                # Over-fetch when language filter applied (post-filter may drop hits)
+                n_results = top_k * 8 if suffix else top_k * 2
                 query_filter = {"lang_suffix": suffix} if suffix else None
-                c_res = self.chroma_collection.query(
-                    query_embeddings=q_emb,
-                    n_results=n_results,
-                    where=query_filter,
-                )
+                try:
+                    c_res = self.chroma_collection.query(
+                        query_embeddings=q_emb,
+                        n_results=n_results,
+                        where=query_filter,
+                    )
+                except Exception:
+                    # Metadata may lack lang_suffix (legacy index) — query unfiltered
+                    c_res = self.chroma_collection.query(
+                        query_embeddings=q_emb,
+                        n_results=n_results,
+                    )
                 if c_res["ids"] and len(c_res["ids"][0]) > 0:
                     for idx, ekey in enumerate(c_res["ids"][0]):
+                        if suffix and not self._is_correct_lang(ekey, suffix):
+                            continue
                         dist = c_res["distances"][0][idx] if c_res.get("distances") else 0.0
-                        score = max(0.0, min(1.0, 1.0 - (dist / 2.0)))
+                        # L2 on unit vectors ≈ [0, 2]; map to [0, 1]
+                        score = max(0.0, min(1.0, 1.0 - (float(dist) / 2.0)))
                         results[ekey] = max(results.get(ekey, 0.0), score)
             except Exception as e:
                 logger.warning(f"Vector search failed: {e}. Using RapidFuzz + TF-IDF only.")

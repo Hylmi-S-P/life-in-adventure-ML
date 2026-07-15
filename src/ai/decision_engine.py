@@ -159,28 +159,35 @@ class AIDecisionEngine:
         vec = torch.zeros(20, dtype=torch.float32)
 
         # Player stats (indices 0-5)
-        # player_state may have stats at top level OR nested under "stats" key
+        # Accept nested "stats", top-level, and aliases (str/strength, int/intelligence)
         if isinstance(player_state, dict) and "stats" in player_state:
-            stats = player_state["stats"]
+            stats = dict(player_state["stats"] or {})
         else:
-            stats = player_state or {}
-        vec[0] = (stats.get("str", 10) or 10) / 20.0
-        vec[1] = (stats.get("dex", 10) or 10) / 20.0
-        vec[2] = (stats.get("int", 10) or 10) / 20.0
-        vec[3] = (stats.get("cha", 10) or 10) / 20.0
-        vec[4] = (stats.get("con", 10) or 10) / 20.0
-        vec[5] = (stats.get("wis", 10) or 10) / 20.0
+            stats = dict(player_state or {})
 
-        # Index 6-9: HP, sanity, gold, step — also read from stats dict
-        # (in the LiA data model these are all player character attributes)
-        hp = stats.get("hp", 100)
-        vec[6] = hp / 100.0
+        def _stat(short: str, *aliases: str, default: float = 10.0) -> float:
+            for k in (short, *aliases):
+                if k in stats and stats[k] is not None:
+                    return float(stats[k])
+            return default
 
-        sanity = stats.get("sanity", 100)
-        vec[7] = sanity / 100.0
+        vec[0] = _stat("str", "strength") / 20.0
+        vec[1] = _stat("dex") / 20.0
+        vec[2] = _stat("int", "intelligence") / 20.0
+        vec[3] = _stat("cha") / 20.0
+        vec[4] = _stat("con") / 20.0
+        vec[5] = _stat("wis") / 20.0
 
-        gold = stats.get("gold", 50)
-        vec[8] = min(10.0, gold / 100.0)
+        # Index 6-9: HP, sanity, gold, step (top-level or inside stats)
+        root = player_state if isinstance(player_state, dict) else {}
+        hp = root.get("hp", stats.get("hp", 100)) or 100
+        vec[6] = float(hp) / 100.0
+
+        sanity = root.get("sanity", stats.get("sanity", 100)) or 100
+        vec[7] = float(sanity) / 100.0
+
+        gold = root.get("gold", stats.get("gold", 50)) or 50
+        vec[8] = min(10.0, float(gold) / 100.0)
 
         step = (player_state or {}).get("step", 0)
         vec[9] = step / 100.0
@@ -251,7 +258,7 @@ class AIDecisionEngine:
                 if obs_np.ndim == 1:
                     obs_np = obs_np.reshape(1, -1)
                 action, _ = self._ppo_model.predict(obs_np, deterministic=False)
-                ppo_action = int(action[0] if hasattr(action, "__len__") else action)
+                ppo_action = int(np.asarray(action).reshape(-1)[0])
                 ppo_action = max(0, min(ppo_action, num_visible - 1))
                 logger.info(
                     f"SB3 PPO fallback: action {ppo_action} (num_visible={num_visible})"
