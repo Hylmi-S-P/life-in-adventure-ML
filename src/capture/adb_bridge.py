@@ -44,15 +44,51 @@ class AdbBridge:
             return None
 
     def _get_screen_size(self) -> Optional[Tuple[int, int]]:
-        """Query internal Android VM screen dimensions via 'wm size'."""
+        """
+        Query the coordinate space used by `input tap`.
+
+        CRITICAL: `wm size` often reports physical (e.g. 1600x900 landscape) while
+        the focused app is rotated portrait (900x1600). Input coordinates follow the
+        *logical/app* frame, not physical — using physical size misses every tap.
+        Prefer dumpsys window app bounds, then DisplayViewport, then wm size.
+        """
+        # 1) Focused app bounds: mBounds=[0,0][W,H] under Application tokens
+        out = self._run_cmd(["shell", "dumpsys", "window", "displays"], timeout=3.0)
+        if out:
+            # Prefer app=WxH on Display line, or mBounds of task
+            m_app = re.search(r"\bapp=(\d+)x(\d+)\b", out)
+            if m_app:
+                w, h = int(m_app.group(1)), int(m_app.group(2))
+                logger.info(f"📱 ADB app/logical size (dumpsys window app=): {w}x{h}")
+                return (w, h)
+            # First task mBounds=[0,0][W,H]
+            m_bounds = re.search(r"mBounds=\[0,0\]\[(\d+),(\d+)\]", out)
+            if m_bounds:
+                w, h = int(m_bounds.group(1)), int(m_bounds.group(2))
+                logger.info(f"📱 ADB app size (mBounds): {w}x{h}")
+                return (w, h)
+
+        # 2) DisplayViewport logicalFrame
+        out = self._run_cmd(["shell", "dumpsys", "display"], timeout=3.0)
+        if out:
+            m = re.search(
+                r"logicalFrame=Rect\(0,\s*0\s*-\s*(\d+),\s*(\d+)\)", out
+            )
+            if m:
+                w, h = int(m.group(1)), int(m.group(2))
+                logger.info(f"📱 ADB logicalFrame size: {w}x{h}")
+                return (w, h)
+
+        # 3) Fallback: wm size (may be wrong orientation)
         out = self._run_cmd(["shell", "wm", "size"], timeout=2.0)
         if out:
-            # e.g., "Physical size: 1080x1920" or "Override size: 720x1280"
             m = re.findall(r"(\d+)x(\d+)", out)
             if m:
-                # Use the last size reported (Override size if present, else Physical size)
                 w, h = int(m[-1][0]), int(m[-1][1])
-                logger.debug(f"📱 ADB detected internal screen resolution: {w}x{h}")
+                logger.warning(
+                    f"📱 ADB using wm size fallback {w}x{h} "
+                    f"(may mismatch rotated app — taps can miss)"
+                )
                 return (w, h)
         return None
 
@@ -136,8 +172,46 @@ class AdbBridge:
         if win_width and win_height and self.adb_screen_size:
             ox, oy = x, y
             x, y = self._scale_pc_to_adb(x, y, win_width, win_height)
-            logger.debug(f"ADB tap scale client({ox},{oy})->{(x,y)} win={win_width}x{win_height} adb={self.adb_screen_size}")
+            logger.info(
+                f"📱 ADB tap client({ox},{oy})→device({x},{y}) "
+                f"win={win_width}x{win_height} adb={self.adb_screen_size}"
+            )
         res = self._run_cmd(["shell", "input", "tap", str(max(0, x)), str(max(0, y))])
+        return res is not None
+
+    def tap_text(self, text: str, partial: bool = True) -> bool:
+        """
+        Pixel-perfect tap via UIAutomator: find node by text, tap its center.
+        Best path for choice buttons when OCR text matches Android accessibility tree.
+        Unity games often expose little text — returns False if no node found.
+        """
+        if not self.connected or not text or not text.strip():
+            return False
+        needle = text.strip().lower()
+        nodes = self.dump_ui_nodes()
+        if not nodes:
+            logger.debug("ADB tap_text: no UIAutomator nodes (Unity may not expose text)")
+            return False
+        best = None
+        best_score = 0
+        for n in nodes:
+            t = (n.get("text") or "").strip().lower()
+            if not t:
+                continue
+            if t == needle:
+                best = n
+                best_score = 100
+                break
+            if partial and (needle in t or t in needle) and len(t) >= 2:
+                score = min(len(needle), len(t))
+                if score > best_score:
+                    best_score = score
+                    best = n
+        if not best:
+            return False
+        cx, cy = best["center"]
+        logger.info(f"📱 ADB UIAutomator tap_text '{text[:40]}' → device({cx},{cy})")
+        res = self._run_cmd(["shell", "input", "tap", str(cx), str(cy)])
         return res is not None
 
     def swipe(

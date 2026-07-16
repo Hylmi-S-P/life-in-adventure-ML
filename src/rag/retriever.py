@@ -238,7 +238,12 @@ class RAGRetriever:
                 "choices_count": len(ev.get("choices", []))
             })
 
-        is_matched = best_score >= self.similarity_threshold
+        # Require stronger match for short OCR (noise / partial dialogue).
+        # Weak scores (<0.55) often pick wrong quests with similar vocabulary.
+        match_threshold = self.similarity_threshold
+        if len(ocr_text.strip()) < 40:
+            match_threshold = max(match_threshold, 0.62)
+        is_matched = best_score >= match_threshold
 
         # Parse choices and result branches for top match, applying active player inventory/stats requirements filter
         formatted_choices = []

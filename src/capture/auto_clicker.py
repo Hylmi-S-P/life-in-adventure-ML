@@ -297,7 +297,7 @@ class AutoClicker:
                 target_y = top + int(height * (0.86 - max(0, choices_count - 1 - choice_idx) * 0.08))
 
         # target_x, target_y are in ABSOLUTE SCREEN coords
-        return self._execute_click(target_x, target_y, f"choice #{choice_idx}", rect)
+        return self._execute_click(target_x, target_y, f"choice #{choice_idx}", rect, choice_text=choice_text)
 
     def click_advance_dialog(
         self,
@@ -373,52 +373,85 @@ class AutoClicker:
         if not ocr_matched:
             logger.info(f"🖱️ Advance geometric fallback: ({target_x}, {target_y})")
 
-        return self._execute_click(target_x, target_y, "advance", rect)
+        return self._execute_click(target_x, target_y, "advance", rect, choice_text="")
 
-    def _execute_click(self, x: int, y: int, label: str, window_rect: Optional[Dict[str, int]] = None) -> bool:
+    def _execute_click(
+        self,
+        x: int,
+        y: int,
+        label: str,
+        window_rect: Optional[Dict[str, int]] = None,
+        choice_text: str = "",
+    ) -> bool:
         """
-        Execute a single click at (x, y) in ABSOLUTE SCREEN coordinates.
-        Uses ADB if connected (computes emulator-relative tap coords internally),
-        otherwise Win32api SetCursorPos / mouse_event.
+        Click at (x, y) absolute screen coords.
+
+        Prefer ADB (native emulator input) when connected:
+          1) UIAutomator text match on choice_text (pixel-perfect if tree has text)
+          2) Scaled coordinate tap (logical app size, not physical wm size)
+        Then always try Win32 as second channel so a bad ADB scale still clicks.
         """
         try:
             logger.info(f"🖱️ Clicking {label} at ({x}, {y})...")
+            adb_ok = False
             if self.adb and getattr(self.adb, "connected", False):
-                # Compute emulator client origin from HWND for ADB scaling.
-                hwnd, rect = self._get_screen_rect()
-                wr = window_rect or rect or {}
-                if hwnd and _WIN32_AVAILABLE:
+                # 1) Best: tap by accessibility text (no scale math)
+                if choice_text and hasattr(self.adb, "tap_text"):
                     try:
-                        client_origin = win32gui.ClientToScreen(hwnd, (0, 0))
-                        rel_x = x - client_origin[0]
-                        rel_y = y - client_origin[1]
-                    except Exception:
+                        if self.adb.tap_text(choice_text):
+                            adb_ok = True
+                            logger.info(f"✅ ADB UIAutomator text tap OK for '{choice_text[:40]}'")
+                    except Exception as e:
+                        logger.debug(f"ADB tap_text failed: {e}")
+
+                # 2) Coordinate path with logical size scaling
+                if not adb_ok:
+                    hwnd, rect = self._get_screen_rect()
+                    wr = window_rect or rect or {}
+                    if hwnd and _WIN32_AVAILABLE:
+                        try:
+                            client_origin = win32gui.ClientToScreen(hwnd, (0, 0))
+                            rel_x = x - client_origin[0]
+                            rel_y = y - client_origin[1]
+                        except Exception:
+                            rel_x = x - wr.get("left", 0)
+                            rel_y = y - wr.get("top", 0)
+                    else:
                         rel_x = x - wr.get("left", 0)
                         rel_y = y - wr.get("top", 0)
-                else:
-                    rel_x = x - wr.get("left", 0)
-                    rel_y = y - wr.get("top", 0)
-                # CRITICAL: ADB must scale from PC window size → emulator internal resolution
-                win_w = wr.get("width", 0)
-                win_h = wr.get("height", 0)
-                if self.adb.tap(rel_x, rel_y, win_width=win_w, win_height=win_h):
-                    time.sleep(self.click_delay)
-                    return True
-                # ADB tap failed — fall through to Win32
+                    # Prefer client size (GetClientRect) over full window chrome rect
+                    win_w = wr.get("width", 0)
+                    win_h = wr.get("height", 0)
+                    if hwnd and _WIN32_AVAILABLE:
+                        try:
+                            cl = win32gui.GetClientRect(hwnd)
+                            # (left, top, right, bottom) relative to client
+                            cw, ch = cl[2] - cl[0], cl[3] - cl[1]
+                            if cw > 0 and ch > 0:
+                                win_w, win_h = cw, ch
+                        except Exception:
+                            pass
+                    if self.adb.tap(rel_x, rel_y, win_width=win_w, win_height=win_h):
+                        adb_ok = True
 
-            if not _WIN32_AVAILABLE:
-                logger.warning("ADB tap failed and Win32 unavailable. Click not executed.")
-                return False
+            # Win32: reliable on Windows host even when ADB orientation is wrong
+            win32_ok = False
+            if _WIN32_AVAILABLE:
+                self._ensure_window_focus()
+                win32api.SetCursorPos((x, y))
+                time.sleep(0.12)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, x, y, 0, 0)
+                time.sleep(0.08)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, x, y, 0, 0)
+                win32_ok = True
+                logger.info(f"✅ Win32 click at screen({x},{y})")
 
-            self._ensure_window_focus()
-            # Win32 SetCursorPos and mouse_event use absolute screen coordinates
-            win32api.SetCursorPos((x, y))
-            time.sleep(0.15)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, x, y, 0, 0)
-            time.sleep(0.08)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, x, y, 0, 0)
-            time.sleep(self.click_delay)
-            return True
+            if adb_ok or win32_ok:
+                time.sleep(self.click_delay)
+                return True
+
+            logger.warning("ADB and Win32 both unavailable/failed. Click not executed.")
+            return False
         except Exception as e:
             logger.error(f"Click failed: {e}")
             return False
