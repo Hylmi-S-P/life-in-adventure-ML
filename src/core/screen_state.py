@@ -10,6 +10,7 @@ Classifies the current emulator screen into one of:
   UNKNOWN  — could not determine
 """
 
+import re
 from enum import Enum
 from typing import List, Dict, Any, Tuple
 
@@ -94,7 +95,9 @@ class ScreenStateMachine:
         if stats_hits >= 3:
             return ScreenState.STATS, min(1.0, 0.5 + stats_hits * 0.1)
 
-        # Advance-button detection — presence of "Continue" / "Kembali" etc.
+        # Advance-button detection — "Continue" / "Kembali" etc.
+        # Prefer short OCR boxes (buttons). Also accept full-text signal when
+        # the only interactive control is Continue (post-choice result screen).
         advance_found = False
         for box in ocr_boxes:
             box_text = box.get("text", "").lower().strip()
@@ -104,9 +107,23 @@ class ScreenStateMachine:
             if words & _ADVANCE_SET:
                 advance_found = True
                 break
+            # Exact / near-exact continue button labels
+            if box_text in _ADVANCE_SET or box_text.rstrip(".…") in _ADVANCE_SET:
+                advance_found = True
+                break
 
         if advance_found:
             return ScreenState.DIALOGUE, 0.85
+
+        # Post-choice result: narrative still on screen + "continue" somewhere
+        # and no numbered multi-choice panel → treat as dialogue advance.
+        if "continue" in text_lower or "kembali" in text_lower:
+            has_numbered_choices = any(
+                re.match(r"^\s*[1-9]\s*[.)]", (b.get("text") or "").strip())
+                for b in ocr_boxes
+            )
+            if not has_numbered_choices:
+                return ScreenState.DIALOGUE, 0.75
 
         # Default: choices likely visible.
         return ScreenState.CHOICE, 0.7

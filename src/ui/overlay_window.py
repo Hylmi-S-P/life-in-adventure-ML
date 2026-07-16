@@ -351,6 +351,10 @@ class OverlayWindow:
         """Background thread running continuous autonomous OCR scan → AI recommend → Auto-click loop."""
         stuck_iterations = 0
         screen_classifier = ScreenStateMachine()
+        # After we click a choice on an event, the next screen is often the same
+        # narrative + a "Continue" button. Re-matching the same event causes a
+        # re-click loop (see feedback ID 31). Track last clicked event key.
+        last_clicked_event_key: Optional[str] = None
         while self.state.autoplay_active:
             try:
                 # ── Step 1: Ad-Shield check ─────────────────────────────────────
@@ -443,9 +447,13 @@ class OverlayWindow:
                     time.sleep(1.5)
                     continue
                 if screen_state == ScreenState.DIALOGUE:
-                    logger.debug("💬 Dialogue screen — tapping advance (no RAG)")
+                    logger.info("💬 Dialogue/Continue screen — tapping advance (no RAG)")
                     if self.clicker:
-                        self.clicker.click_advance_dialog(scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect)
+                        self.clicker.click_advance_dialog(
+                            scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect
+                        )
+                    # Cleared so next distinct quest can be decided again
+                    last_clicked_event_key = None
                     self.dedup.reset()
                     stuck_iterations = 0
                     time.sleep(1.0)
@@ -466,14 +474,36 @@ class OverlayWindow:
 
                 if ret_res.get("matched") and ret_res.get("event"):
                     event_data = ret_res["event"]
+                    ekey = event_data.get("event_key") or ""
+
+                    # ── Same-event guard (post-choice Continue screen) ─────────
+                    # After clicking a choice, the result screen often keeps the
+                    # same narrative text → RAG rematches the same event and
+                    # re-clicks the same choice forever (feedback ID 31).
+                    if last_clicked_event_key and ekey == last_clicked_event_key:
+                        logger.info(
+                            f"🔁 Same event '{ekey}' after prior click — "
+                            f"tapping Continue/advance instead of re-clicking choice"
+                        )
+                        if self.clicker:
+                            self.clicker.click_advance_dialog(
+                                scroll_first=False,
+                                ocr_boxes=ocr_boxes,
+                                window_rect=cap_rect,
+                            )
+                        self.dedup.reset()
+                        stuck_iterations = 0
+                        time.sleep(1.2)
+                        continue
+
                     full_ev = ret_res.get("event_full")  # already includes choices — no double-fetch
                     if full_ev is None:
-                        full_ev = self.retriever.kb.get_event_with_choices(event_data["event_key"])
+                        full_ev = self.retriever.kb.get_event_with_choices(ekey)
                     if full_ev:
                         full_ev["choices"] = ret_res["choices"]
                     score = ret_res.get("confidence", 0.0)
                     logger.info(
-                        f"✅ RAG matched: '{event_data['event_key']}' "
+                        f"✅ RAG matched: '{ekey}' "
                         f"(Score: {score:.2f}, Lang: {active_lang})"
                     )
 
@@ -487,7 +517,7 @@ class OverlayWindow:
                     # Session logging
                     if rec and rec.get("recommended_choice_idx", -1) >= 0 and hasattr(self, "session_logger"):
                         self.session_logger.log_event(
-                            event_key=event_data["event_key"],
+                            event_key=ekey,
                             ocr_text=ocr_text,
                             choice_recommended=rec.get("recommended_choice_text", "Unknown"),
                             choice_index=rec["recommended_choice_idx"],
@@ -511,10 +541,14 @@ class OverlayWindow:
                                 ocr_boxes=ocr_boxes,
                                 choices_count=c_count,
                             )
+                            last_clicked_event_key = ekey
                             self.clicker.reset_scroll_guard()
                             stuck_iterations = 0
                             # ── Post-click transition wait ──────────────────────
                             self._wait_for_transition(img, cap_rect)
+                            # After result text appears, many screens need an
+                            # immediate Continue tap before the next quest.
+                            self._maybe_click_continue_after_choice(cap_rect)
                             self.dedup.reset()
                             continue  # restart loop with fresh OCR
                         else:
@@ -622,6 +656,47 @@ class OverlayWindow:
                 # Full traceback for unexpected errors — no more silent swallowing.
                 logger.exception(f"Unexpected error in auto-play: {e}")
                 time.sleep(2.0)
+
+    def _maybe_click_continue_after_choice(self, cap_rect: dict) -> None:
+        """
+        After a choice click + transition, many LiA events show a Continue
+        button on the result screen. Tap it once if detected so we don't
+        re-enter RAG on the same narrative (feedback ID 31).
+        """
+        if not self.clicker or not self.capture or not self.ocr:
+            return
+        try:
+            frame = self.capture.capture_frame()
+            if not frame or not frame.image:
+                return
+            img = frame.image
+            ox, oy = frame.capture_origin
+            crop_offset_y = int(img.height * 0.35)
+            ocr_text, ocr_boxes = self.ocr.extract_text_and_boxes(img)
+            rescale = 1.0 / getattr(self.ocr, "resize_factor", 1.0)
+            for box in ocr_boxes:
+                c = box.get("center")
+                if c:
+                    box["center"] = (
+                        int(c[0] * rescale) + ox,
+                        int(c[1] * rescale) + oy + crop_offset_y,
+                    )
+            text_l = (ocr_text or "").lower()
+            has_continue = "continue" in text_l or "kembali" in text_l
+            has_continue_box = any(
+                "continue" in (b.get("text") or "").lower()
+                or "kembali" in (b.get("text") or "").lower()
+                for b in ocr_boxes
+            )
+            if has_continue or has_continue_box:
+                logger.info("➡️ Post-choice Continue detected — tapping advance")
+                wr = frame.window_rect or cap_rect
+                self.clicker.click_advance_dialog(
+                    scroll_first=False, ocr_boxes=ocr_boxes, window_rect=wr
+                )
+                time.sleep(0.8)
+        except Exception as e:
+            logger.debug(f"Post-choice continue check failed: {e}")
 
     def _wait_for_transition(self, pre_click_img, cap_rect: dict) -> None:
         """
