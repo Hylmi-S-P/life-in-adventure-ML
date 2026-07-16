@@ -14,6 +14,9 @@ import loguru
 from src.core.thread_safe_state import ThreadSafeState
 from src.core.screen_dedup import ScreenDeduplicator
 from src.core.screen_state import ScreenStateMachine, ScreenState
+from src.core.button_scanner import ButtonScanner
+from src.core.session_memory import SessionMemory
+from src.core.action_selector import ActionSelector, BotAction
 from src.capture.auto_clicker import AutoClicker
 
 try:
@@ -348,304 +351,238 @@ class OverlayWindow:
             logger.error(f"Failed to open SettingsPanel: {e}")
 
     def _auto_play_loop(self):
-        """Background thread running continuous autonomous OCR scan → AI recommend → Auto-click loop."""
+        """
+        Action-aware autoplay:
+          capture → OCR → ButtonScanner → SessionMemory → ActionSelector → execute
+        RAG only when selector.needs_rag() (CHOICE screens, not Continue/Combat).
+        """
         stuck_iterations = 0
         screen_classifier = ScreenStateMachine()
-        # After we click a choice on an event, the next screen is often the same
-        # narrative + a "Continue" button. Re-matching the same event causes a
-        # re-click loop (see feedback ID 31). Track last clicked event key.
-        last_clicked_event_key: Optional[str] = None
+        scanner = ButtonScanner()
+        selector = ActionSelector(scanner=scanner)
+        memory = SessionMemory()
+
         while self.state.autoplay_active:
             try:
-                # ── Step 1: Ad-Shield check ─────────────────────────────────────
-                if self.capture and getattr(self.capture, "ad_playing", False):
-                    logger.warning("🛑 Ad-Shield detected live ad during Auto-Play! Pausing for 4 seconds...")
+                # ── 1. Ad-Shield ──────────────────────────────────────────────
+                ad_playing = bool(self.capture and getattr(self.capture, "ad_playing", False))
+                if ad_playing:
+                    logger.warning("🛑 Ad-Shield: pausing 4s")
                     time.sleep(4.0)
                     continue
 
-                # ── Step 2: Capture + duplicate-screen detection ─────────────────
+                # ── 2. Capture + dedup + OCR ──────────────────────────────────
                 img = None
+                ocr_text = ""
                 ocr_boxes: List[dict] = []
                 cap_rect: Dict[str, int] = {}
-                cap_origin: Tuple[int, int] = (0, 0)  # screen-space origin of captured image
-                crop_offset_y: int = 0  # crop offset for OCR box coordinate fix
                 if self.capture and self.ocr:
                     frame = self.capture.capture_frame()
                     if frame:
                         img = frame.image
                         cap_rect = frame.window_rect or {}
                         cap_origin = frame.capture_origin
-                        # ── Dedup on cropped image (matches what OCR sees) ──
-                        # OcrEngine._preprocess crops top 35% (static header) before
-                        # EasyOCR runs. Dedup must crop the same region, otherwise the
-                        # static header dominates the hash → "unchanged" → infinite loop.
                         crop_offset_y = int(img.height * 0.35)
                         dedup_img = img.crop((0, crop_offset_y, img.width, img.height))
                         is_dup, dup_count = self.dedup.is_duplicate(dedup_img)
                         if is_dup and dup_count >= 2:
-                            logger.info(f"♻️ Auto-Play: screen unchanged for {dup_count} cycles — advancing dialog (no scroll).")
-                            if self.clicker:
-                                # Never scroll on dedup — the screen hasn't changed,
-                                # so scrolling won't reveal anything new. Just tap center.
-                                self.clicker.click_advance_dialog(scroll_first=False, ocr_boxes=[], window_rect=cap_rect)
+                            logger.info(
+                                f"♻️ Screen unchanged {dup_count} cycles — advance"
+                            )
+                            action = BotAction(type="advance", reason="dedup_unchanged")
+                            self._execute_bot_action(
+                                action, ocr_boxes=[], cap_rect=cap_rect, memory=memory
+                            )
                             self.dedup.reset()
                             time.sleep(1.0)
                             continue
-                        # Single-pass OCR: calls OcrEngine.extract_text_and_boxes, which
-                        # internally crops top 35% then runs EasyOCR. Boxes are relative
-                        # to the cropped image: (0,0) = (0, crop_offset_y) in full frame.
                         ocr_text, ocr_boxes = self.ocr.extract_text_and_boxes(img)
-                        # Convert OCR boxes from cropped-image coords to absolute screen coords.
-                        # screen = cropped * (1/resize_factor) + capture_origin + (0, crop_offset_y)
-                        # The 1/resize_factor undoes the shrink that _preprocess applies before
-                        # EasyOCR runs. Default resize_factor=1.0 → no scaling needed.
                         ox, oy = cap_origin
                         rescale = 1.0 / getattr(self.ocr, "resize_factor", 1.0)
                         for box in ocr_boxes:
                             c = box.get("center")
                             if c:
-                                box["center"] = (int(c[0] * rescale) + ox, int(c[1] * rescale) + oy + crop_offset_y)
+                                box["center"] = (
+                                    int(c[0] * rescale) + ox,
+                                    int(c[1] * rescale) + oy + crop_offset_y,
+                                )
                             bbox = box.get("bbox")
                             if bbox:
-                                box["bbox"] = [[int(pt[0] * rescale) + ox, int(pt[1] * rescale) + oy + crop_offset_y] for pt in bbox]
-                    else:
-                        ocr_text = ""
-                else:
-                    ocr_text = ""
+                                box["bbox"] = [
+                                    [
+                                        int(pt[0] * rescale) + ox,
+                                        int(pt[1] * rescale) + oy + crop_offset_y,
+                                    ]
+                                    for pt in bbox
+                                ]
 
-                # ── Step 2b: Auto-parse player stats from stats panel screen ──────────
                 if ocr_text:
                     parsed = self._ocr_parse_stats(ocr_text)
                     if parsed:
-                        old_stats = self.state.player_stats
                         self.state.player_stats = parsed
-                        logger.info(f"📊 Auto-updated player stats from OCR: {parsed} (was: {old_stats})")
+                        logger.info(f"📊 Stats from OCR: {parsed}")
 
-                # ── Step 3: Empty-screen recovery ────────────────────────────────
                 if not ocr_text or not ocr_text.strip():
                     stuck_iterations += 1
                     if stuck_iterations >= 3:
-                        logger.info("🕹️ No text for 3 cycles — scrolling and tapping to advance...")
-                        if self.clicker:
-                            self.clicker.click_advance_dialog(scroll_first=True, ocr_boxes=ocr_boxes, window_rect=cap_rect)
-                        self.dedup.reset()
+                        self._execute_bot_action(
+                            BotAction(type="scroll", reason="empty_ocr"),
+                            ocr_boxes=ocr_boxes,
+                            cap_rect=cap_rect,
+                            memory=memory,
+                        )
                         stuck_iterations = 0
                     time.sleep(1.5)
                     continue
 
-                # ── Step 3b: Screen state classification ────────────────────────
-                # Skip RAG for COMBAT (needs advance, not choice), DIALOGUE, AD, STATS.
-                ad_playing = bool(self.capture and getattr(self.capture, "ad_playing", False))
-                screen_state, _ = screen_classifier.classify(ocr_text, ocr_boxes, ad_playing)
-                if screen_state == ScreenState.COMBAT:
-                    # Battle UI: tap "Begin Battle" / advance; don't RAG
-                    logger.info("⚔️ Combat screen — advancing battle (no RAG)")
-                    if self.clicker:
-                        self.clicker.click_advance_dialog(scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect)
-                    self.dedup.reset()
-                    stuck_iterations = 0
-                    time.sleep(1.5)
-                    continue
-                if screen_state == ScreenState.DIALOGUE:
-                    logger.info("💬 Dialogue/Continue screen — tapping advance (no RAG)")
-                    if self.clicker:
-                        self.clicker.click_advance_dialog(
-                            scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect
-                        )
-                    # Cleared so next distinct quest can be decided again
-                    last_clicked_event_key = None
-                    self.dedup.reset()
-                    stuck_iterations = 0
-                    time.sleep(1.0)
-                    continue
+                # ── 3. UI-first: buttons + screen state ────────────────────────
+                buttons = scanner.scan(ocr_boxes, ocr_text, cap_rect)
+                screen_state, st_conf = screen_classifier.classify(
+                    ocr_text, ocr_boxes, ad_playing
+                )
+                logger.debug(
+                    f"🖥️ state={screen_state.value} conf={st_conf:.2f} "
+                    f"buttons={[b.kind for b in buttons[:6]]} "
+                    f"pending_cont={memory.pending_continue}"
+                )
 
-                # ── Step 4: RAG retrieval ───────────────────────────────────────
-                # Read language / stats from thread-safe state snapshots
-                # (NOT self.lang_var — reading Tk StringVar from background thread risks segfault).
+                # ── 4. Lazy RAG (only if selector says so) ────────────────────
+                ret_res = None
+                rec = None
+                full_ev = None
                 active_lang = self.state.get_language()
                 stats = self.state.player_stats
                 inv = self.state.player_inventory
-                ret_res = self.retriever.retrieve_for_ocr(
-                    ocr_text,
-                    language=active_lang,
-                    player_stats=stats,
-                    player_inventory=inv,
-                )
 
-                if ret_res.get("matched") and ret_res.get("event"):
-                    event_data = ret_res["event"]
-                    ekey = event_data.get("event_key") or ""
-
-                    # ── Same-event guard (post-choice Continue screen) ─────────
-                    # After clicking a choice, the result screen often keeps the
-                    # same narrative text → RAG rematches the same event and
-                    # re-clicks the same choice forever (feedback ID 31).
-                    if last_clicked_event_key and ekey == last_clicked_event_key:
-                        logger.info(
-                            f"🔁 Same event '{ekey}' after prior click — "
-                            f"tapping Continue/advance instead of re-clicking choice"
-                        )
-                        if self.clicker:
-                            self.clicker.click_advance_dialog(
-                                scroll_first=False,
-                                ocr_boxes=ocr_boxes,
-                                window_rect=cap_rect,
-                            )
-                        self.dedup.reset()
-                        stuck_iterations = 0
-                        time.sleep(1.2)
-                        continue
-
-                    full_ev = ret_res.get("event_full")  # already includes choices — no double-fetch
-                    if full_ev is None:
-                        full_ev = self.retriever.kb.get_event_with_choices(ekey)
-                    if full_ev:
-                        full_ev["choices"] = ret_res["choices"]
-                    score = ret_res.get("confidence", 0.0)
-                    logger.info(
-                        f"✅ RAG matched: '{ekey}' "
-                        f"(Score: {score:.2f}, Lang: {active_lang})"
+                if self.retriever and selector.needs_rag(
+                    screen_state, buttons, memory, ad_playing=ad_playing
+                ):
+                    ret_res = self.retriever.retrieve_for_ocr(
+                        ocr_text,
+                        language=active_lang,
+                        player_stats=stats,
+                        player_inventory=inv,
                     )
-
-                    rec = {}
-                    if self.ai_engine and full_ev:
-                        rec = self.ai_engine.recommend_choice(full_ev, player_state={"stats": stats, "player_exp": stats.get("exp", 0), "player_alignment": stats.get("alignment", 0)})
-
-                    # Lambda capture fix: use default args to capture by value (not by reference).
-                    self.root.after(0, lambda ev=full_ev, r=rec: self._update_display(ev, r))
-
-                    # Session logging
-                    if rec and rec.get("recommended_choice_idx", -1) >= 0 and hasattr(self, "session_logger"):
-                        self.session_logger.log_event(
-                            event_key=ekey,
-                            ocr_text=ocr_text,
-                            choice_recommended=rec.get("recommended_choice_text", "Unknown"),
-                            choice_index=rec["recommended_choice_idx"],
-                            screenshot_image=img,
-                        )
-
-                    # ── Step 5: Click execution ─────────────────────────────────
-                    if self.clicker and "recommended_choice_idx" in rec:
-                        choice_idx = rec["recommended_choice_idx"]
-                        if choice_idx >= 0:
-                            choice_txt = rec.get("recommended_choice_text", "")
-                            c_count = len(full_ev.get("choices", []))
-                            logger.info(
-                                f"🎮 Clicking choice #{choice_idx + 1} "
-                                f"('{choice_txt[:30]}') / {c_count} total..."
-                            )
-                            self.clicker.click_choice(
-                                choice_idx,
-                                window_rect=cap_rect,
-                                choice_text=choice_txt,
-                                ocr_boxes=ocr_boxes,
-                                choices_count=c_count,
-                            )
-                            last_clicked_event_key = ekey
-                            self.clicker.reset_scroll_guard()
-                            stuck_iterations = 0
-                            # ── Post-click transition wait ──────────────────────
-                            self._wait_for_transition(img, cap_rect)
-                            # After result text appears, many screens need an
-                            # immediate Continue tap before the next quest.
-                            self._maybe_click_continue_after_choice(cap_rect)
-                            self.dedup.reset()
-                            continue  # restart loop with fresh OCR
-                        else:
-                            if self.clicker:
-                                # Only scroll if choices are NOT already visible
-                                scroll = not AutoClicker._choices_visible(ocr_boxes)
-                                self.clicker.click_advance_dialog(scroll_first=scroll, ocr_boxes=ocr_boxes, window_rect=cap_rect)
-                            self.dedup.reset()
-                            stuck_iterations = 0
-                            time.sleep(1.5)
-                    else:
-                        time.sleep(1.5)
-
-                else:
-                    # ── No confident RAG match ──────────────────────────────────
-                    candidates = ret_res.get("candidates", [])
-                    best_cand = candidates[0] if candidates else {}
-                    best_score = best_cand.get("confidence", 0.0)
-                    preview = ocr_text.replace("\n", " ").strip()[:45]
-                    logger.info(
-                        f"🔎 OCR: '{preview}…' | "
-                        f"Top: '{best_cand.get('event_key', 'None')}' "
-                        f"(Score: {best_score:.2f})"
-                    )
-                    stuck_iterations += 1
-
-                    if stuck_iterations >= 2 and best_score >= 0.46 and best_cand.get("event_key"):
-                        # Adaptive fallback: engage candidate when screen has been
-                        # stuck for 2+ cycles and score is above 0.46.
-                        logger.info(
-                            f"⚡ Adaptive fallback: score {best_score:.2f}, "
-                            f"engaging '{best_cand['event_key']}'"
-                        )
-                        full_ev = self.retriever.kb.get_event_with_choices(best_cand["event_key"])
+                    if ret_res.get("matched") and ret_res.get("event"):
+                        ekey = ret_res["event"].get("event_key") or ""
+                        full_ev = ret_res.get("event_full")
+                        if full_ev is None:
+                            full_ev = self.retriever.kb.get_event_with_choices(ekey)
                         if full_ev:
-                            # Filter choices by player requirements
-                            filtered = []
-                            stats_lower = {k.lower(): v for k, v in stats.items()}
-                            visible = 0
-                            for ch in full_ev.get("choices", []):
-                                req = ch.get("required", "")
-                                if self.retriever._is_requirement_met(req, stats_lower, inv):
-                                    filtered.append({
-                                        "choice_idx": visible,
-                                        "original_idx": ch.get("choice_idx"),
-                                        "text": ch.get("text", ""),
-                                        "required": req,
-                                        "results": ch.get("results", []),
-                                    })
-                                    visible += 1
-                            full_ev["choices"] = filtered
-
-                        rec = {}
+                            full_ev["choices"] = ret_res.get("choices") or full_ev.get(
+                                "choices", []
+                            )
+                        score = ret_res.get("confidence", 0.0)
+                        logger.info(
+                            f"✅ RAG matched: '{ekey}' (Score: {score:.2f}, Lang: {active_lang})"
+                        )
                         if self.ai_engine and full_ev:
                             rec = self.ai_engine.recommend_choice(
-                                full_ev, player_state={"stats": stats, "player_exp": stats.get("exp", 0), "player_alignment": stats.get("alignment", 0)}
+                                full_ev,
+                                player_state={
+                                    "stats": stats,
+                                    "player_exp": stats.get("exp", 0),
+                                    "player_alignment": stats.get("alignment", 0),
+                                },
                             )
-                        if full_ev:
-                            # Lambda capture fix: default args = by-value
-                            self.root.after(
-                                0, lambda ev=full_ev, r=rec: self._update_display(ev, r)
+                        self.root.after(
+                            0, lambda ev=full_ev, r=rec or {}: self._update_display(ev, r)
+                        )
+                        if (
+                            rec
+                            and rec.get("recommended_choice_idx", -1) >= 0
+                            and hasattr(self, "session_logger")
+                        ):
+                            self.session_logger.log_event(
+                                event_key=ekey,
+                                ocr_text=ocr_text,
+                                choice_recommended=rec.get(
+                                    "recommended_choice_text", "Unknown"
+                                ),
+                                choice_index=rec["recommended_choice_idx"],
+                                screenshot_image=img,
                             )
-                            if rec and rec.get("recommended_choice_idx", -1) >= 0:
-                                if hasattr(self, "session_logger"):
-                                    self.session_logger.log_event(
-                                        event_key=best_cand["event_key"],
-                                        ocr_text=ocr_text,
-                                        choice_recommended=rec.get("recommended_choice_text", "Unknown"),
-                                        choice_index=rec["recommended_choice_idx"],
-                                        screenshot_image=img,
-                                    )
-                                if self.clicker:
-                                    self.clicker.click_choice(
-                                        rec["recommended_choice_idx"],
-                                        window_rect=cap_rect,
-                                        choice_text=rec.get("recommended_choice_text", ""),
-                                        ocr_boxes=ocr_boxes,
-                                        choices_count=len(full_ev.get("choices", [])),
-                                    )
-                            elif self.clicker:
-                                self.clicker.click_advance_dialog(
-                                    scroll_first=True, ocr_boxes=ocr_boxes, window_rect=cap_rect
-                                )
-                            self.dedup.reset()
-                            stuck_iterations = 0
-                            time.sleep(1.0)
-                    elif stuck_iterations >= 3:
-                        logger.info("👉 Unmatched for 3+ cycles — advancing dialog...")
-                        if self.clicker:
-                            self.clicker.click_advance_dialog(scroll_first=True, ocr_boxes=ocr_boxes, window_rect=cap_rect)
-                        self.dedup.reset()
-                        stuck_iterations = 0
-                        time.sleep(1.5)
                     else:
-                        time.sleep(1.2)
+                        cands = (ret_res or {}).get("candidates") or []
+                        best = cands[0] if cands else {}
+                        preview = ocr_text.replace("\n", " ").strip()[:45]
+                        logger.info(
+                            f"🔎 OCR: '{preview}…' | "
+                            f"Top: '{best.get('event_key', 'None')}' "
+                            f"(Score: {best.get('confidence', 0):.2f})"
+                        )
+                        stuck_iterations += 1
+                        # Adaptive weak match
+                        if (
+                            stuck_iterations >= 2
+                            and best.get("confidence", 0) >= 0.46
+                            and best.get("event_key")
+                        ):
+                            full_ev = self.retriever.kb.get_event_with_choices(
+                                best["event_key"]
+                            )
+                            if full_ev and self.ai_engine:
+                                rec = self.ai_engine.recommend_choice(
+                                    full_ev,
+                                    player_state={
+                                        "stats": stats,
+                                        "player_exp": stats.get("exp", 0),
+                                        "player_alignment": stats.get("alignment", 0),
+                                    },
+                                )
+                                ret_res = {
+                                    "matched": True,
+                                    "event": {"event_key": best["event_key"]},
+                                    "confidence": best.get("confidence", 0),
+                                    "choices": full_ev.get("choices", []),
+                                    "event_full": full_ev,
+                                }
+                                logger.info(
+                                    f"⚡ Adaptive fallback: {best['event_key']} "
+                                    f"score={best.get('confidence', 0):.2f}"
+                                )
+                else:
+                    stuck_iterations = 0
 
-            # ── Granular exception handling (replaces broad except) ─────────────
+                # ── 5. Select + execute action ────────────────────────────────
+                action = selector.select(
+                    screen_state=screen_state,
+                    buttons=buttons,
+                    memory=memory,
+                    rag_result=ret_res,
+                    recommendation=rec,
+                    ad_playing=ad_playing,
+                    stuck_iterations=stuck_iterations,
+                )
+                logger.info(
+                    f"🎯 Action: {action.type} reason={action.reason} "
+                    f"text={action.target_text!r} idx={action.choice_idx}"
+                )
+                did = self._execute_bot_action(
+                    action,
+                    ocr_boxes=ocr_boxes,
+                    cap_rect=cap_rect,
+                    memory=memory,
+                    full_ev=full_ev,
+                    pre_img=img,
+                    choices_count=len((full_ev or {}).get("choices") or []),
+                )
+                if did and action.type in (
+                    "choice",
+                    "continue",
+                    "advance",
+                    "battle",
+                    "dismiss",
+                ):
+                    stuck_iterations = 0
+                    self.dedup.reset()
+                    if self.clicker:
+                        self.clicker.reset_scroll_guard()
+                elif action.type == "wait":
+                    time.sleep(1.2)
+                else:
+                    time.sleep(0.8)
+
             except (ConnectionError, TimeoutError, OSError) as e:
                 logger.error(f"IO/Network error in auto-play: {e}")
                 time.sleep(3.0)
@@ -653,9 +590,99 @@ class OverlayWindow:
                 logger.exception(f"Schema error (missing key {e})")
                 time.sleep(1.0)
             except Exception as e:
-                # Full traceback for unexpected errors — no more silent swallowing.
                 logger.exception(f"Unexpected error in auto-play: {e}")
                 time.sleep(2.0)
+
+    def _execute_bot_action(
+        self,
+        action: BotAction,
+        *,
+        ocr_boxes: List[dict],
+        cap_rect: Dict[str, int],
+        memory: SessionMemory,
+        full_ev: Optional[Dict[str, Any]] = None,
+        pre_img=None,
+        choices_count: int = 1,
+    ) -> bool:
+        """Execute a BotAction via AutoClicker; update SessionMemory."""
+        if not self.clicker:
+            memory.record(action.type, reason=action.reason + "|no_clicker")
+            return False
+
+        ok = False
+        ekey = action.event_key
+
+        if action.type == "wait":
+            memory.record("wait", reason=action.reason)
+            return False
+
+        if action.type == "scroll":
+            ok = bool(self.clicker.scroll_down_dialog(window_rect=cap_rect))
+            time.sleep(0.4)
+            ok = self.clicker.click_advance_dialog(
+                scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect
+            ) or ok
+            memory.record("scroll", reason=action.reason)
+            return ok
+
+        if action.type in ("continue", "advance", "dismiss"):
+            ok = self.clicker.click_advance_dialog(
+                scroll_first=False,
+                ocr_boxes=ocr_boxes,
+                window_rect=cap_rect,
+            )
+            memory.record(
+                "continue" if action.type != "dismiss" else "dismiss",
+                event_key=ekey,
+                reason=action.reason,
+            )
+            memory.clear_pending()
+            return ok
+
+        if action.type == "battle":
+            # Prefer OCR text match for Begin Battle / Simulate
+            if action.target_text:
+                ok = self.clicker.click_choice(
+                    0,
+                    window_rect=cap_rect,
+                    choice_text=action.target_text,
+                    ocr_boxes=ocr_boxes,
+                    choices_count=1,
+                )
+            if not ok:
+                ok = self.clicker.click_advance_dialog(
+                    scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect
+                )
+            memory.record("battle_begin", reason=action.reason)
+            memory.clear_pending()
+            return ok
+
+        if action.type == "choice":
+            idx = action.choice_idx if action.choice_idx is not None else 0
+            txt = action.target_text or ""
+            logger.info(f"🎮 Clicking choice #{idx + 1} ('{txt[:30]}')")
+            ok = self.clicker.click_choice(
+                idx,
+                window_rect=cap_rect,
+                choice_text=txt,
+                ocr_boxes=ocr_boxes,
+                choices_count=max(1, choices_count),
+            )
+            memory.record(
+                "choice",
+                event_key=ekey,
+                choice_text=txt,
+                choice_idx=idx,
+                reason=action.reason,
+            )
+            if pre_img is not None:
+                self._wait_for_transition(pre_img, cap_rect)
+            # Immediate continue if result screen shows it
+            self._maybe_click_continue_after_choice(cap_rect)
+            return ok
+
+        memory.record(action.type, reason=action.reason)
+        return False
 
     def _maybe_click_continue_after_choice(self, cap_rect: dict) -> None:
         """
