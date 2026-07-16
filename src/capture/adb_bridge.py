@@ -85,16 +85,59 @@ class AdbBridge:
         self.connected = False
         return False
 
+    def _scale_pc_to_adb(
+        self, x: float, y: float, win_width: int, win_height: int
+    ) -> Tuple[int, int]:
+        """
+        Map PC client-relative coords → emulator internal coords.
+
+        LDPlayer typically *stretches* the Android framebuffer to the client area
+        (independent X/Y scale). Also support letterbox/pillarbox when AR differs
+        and the content is centered with uniform scale — pick the mapping that
+        keeps the point inside [0, adb_w] x [0, adb_h].
+        """
+        adb_w, adb_h = self.adb_screen_size or (0, 0)
+        if not adb_w or not adb_h or win_width <= 0 or win_height <= 0:
+            return int(x), int(y)
+
+        # Stretch (default LDPlayer): independent axes
+        sx = int(x * adb_w / win_width)
+        sy = int(y * adb_h / win_height)
+
+        win_ar = win_width / float(win_height)
+        adb_ar = adb_w / float(adb_h)
+        if abs(win_ar - adb_ar) > 0.05:
+            # Candidate: uniform scale + center offset (letterbox/pillarbox)
+            if win_ar > adb_ar:
+                scaled_w = win_height * adb_ar
+                ox = (win_width - scaled_w) / 2.0
+                ux = int((x - ox) * (adb_w / scaled_w))
+                uy = int(y * (adb_h / win_height))
+            else:
+                scaled_h = win_width / adb_ar
+                oy = (win_height - scaled_h) / 2.0
+                ux = int(x * (adb_w / win_width))
+                uy = int((y - oy) * (adb_h / scaled_h))
+            # Prefer uniform mapping only if result stays in-bounds
+            if 0 <= ux < adb_w and 0 <= uy < adb_h:
+                # If stretch is also in-bounds, keep stretch (LDPlayer default).
+                # Only switch when stretch is out of bounds.
+                if not (0 <= sx < adb_w and 0 <= sy < adb_h):
+                    sx, sy = ux, uy
+
+        sx = max(0, min(adb_w - 1, sx))
+        sy = max(0, min(adb_h - 1, sy))
+        return sx, sy
+
     def tap(self, x: int, y: int, win_width: Optional[int] = None, win_height: Optional[int] = None) -> bool:
-        """Execute instant OS-level tap at emulator internal coordinates, with auto scaling from PC window bounds."""
+        """Tap at emulator coords; scales from PC client-relative with AR clamp."""
         if not self.connected:
             return False
         if win_width and win_height and self.adb_screen_size:
-            adb_w, adb_h = self.adb_screen_size
-            if win_width > 0 and win_height > 0:
-                x = int(x * (adb_w / win_width))
-                y = int(y * (adb_h / win_height))
-        res = self._run_cmd(["shell", "input", "tap", str(x), str(y)])
+            ox, oy = x, y
+            x, y = self._scale_pc_to_adb(x, y, win_width, win_height)
+            logger.debug(f"ADB tap scale client({ox},{oy})->{(x,y)} win={win_width}x{win_height} adb={self.adb_screen_size}")
+        res = self._run_cmd(["shell", "input", "tap", str(max(0, x)), str(max(0, y))])
         return res is not None
 
     def swipe(
@@ -107,17 +150,20 @@ class AdbBridge:
         win_width: Optional[int] = None,
         win_height: Optional[int] = None,
     ) -> bool:
-        """Execute instant OS-level swipe/scroll gesture inside emulator, with auto scaling from PC window bounds."""
+        """Swipe inside emulator; same scaling as tap."""
         if not self.connected:
             return False
         if win_width and win_height and self.adb_screen_size:
-            adb_w, adb_h = self.adb_screen_size
-            if win_width > 0 and win_height > 0:
-                x1 = int(x1 * (adb_w / win_width))
-                y1 = int(y1 * (adb_h / win_height))
-                x2 = int(x2 * (adb_w / win_width))
-                y2 = int(y2 * (adb_h / win_height))
-        res = self._run_cmd(["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms)])
+            x1, y1 = self._scale_pc_to_adb(x1, y1, win_width, win_height)
+            x2, y2 = self._scale_pc_to_adb(x2, y2, win_width, win_height)
+        res = self._run_cmd(
+            [
+                "shell", "input", "swipe",
+                str(max(0, x1)), str(max(0, y1)),
+                str(max(0, x2)), str(max(0, y2)),
+                str(duration_ms),
+            ]
+        )
         return res is not None
 
     def dump_ui_nodes(self) -> List[Dict[str, Any]]:

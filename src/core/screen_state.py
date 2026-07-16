@@ -1,25 +1,13 @@
 """
 screen_state.py - Screen state classifier for the auto-play loop.
 
-Status: PLANNED — not yet wired into overlay_window.py's _auto_play_loop().
-         Classifier is functionally complete but needs integration work.
-
 Classifies the current emulator screen into one of:
   DIALOGUE — text scrolling, tap to advance
   CHOICE   — choices visible → RAG + decide + click
-  COMBAT   — combat UI → combat stat calculator
+  COMBAT   — combat UI → combat stat calculator / advance battle
   AD       — video ad → pause
   STATS    — stats panel → auto-parse + update player_stats
   UNKNOWN  — could not determine
-
-This lets the auto-play loop skip the expensive RAG pipeline for screens
-that don't need it (dialogue, ads, stats panels).
-
-TODO for integration:
-  - Import ScreenStateMachine in overlay_window.py
-  - Call classify() before RAG pipeline in _auto_play_loop()
-  - Skip RAG for DIALOGUE/AD/STATS states
-  - Test with live gameplay to tune confidence thresholds
 """
 
 from enum import Enum
@@ -41,7 +29,9 @@ _ADVANCE_SET = frozenset(k.lower() for k in _ADVANCE_KEYWORDS)
 # Combat keywords (multiple languages).
 _COMBAT_KEYWORDS = [
     "battle", "combat", "attack", "fight", "전투", "pertempuran",
-    "atk", "hp", "defense", "damaged", "damage",
+    "atk", "hp", "defense", "damaged", "damage", "dodge", "block", "roll",
+    "begin battle", "abandon battle", "victory", "defeat",
+    "power points", "simulate",
 ]
 _COMBAT_SET = frozenset(k.lower() for k in _COMBAT_KEYWORDS)
 
@@ -92,7 +82,9 @@ class ScreenStateMachine:
 
         text_lower = ocr_text.lower()
 
-        # Combat detection — high confidence if multiple keywords match.
+        # Combat detection — phrase first, then multi-keyword.
+        if "begin battle" in text_lower or "abandon battle" in text_lower:
+            return ScreenState.COMBAT, 0.95
         combat_hits = sum(1 for kw in _COMBAT_SET if kw in text_lower)
         if combat_hits >= 2:
             return ScreenState.COMBAT, min(1.0, 0.5 + combat_hits * 0.15)

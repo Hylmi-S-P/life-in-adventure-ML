@@ -13,6 +13,7 @@ import loguru
 
 from src.core.thread_safe_state import ThreadSafeState
 from src.core.screen_dedup import ScreenDeduplicator
+from src.core.screen_state import ScreenStateMachine, ScreenState
 from src.capture.auto_clicker import AutoClicker
 
 try:
@@ -349,6 +350,7 @@ class OverlayWindow:
     def _auto_play_loop(self):
         """Background thread running continuous autonomous OCR scan → AI recommend → Auto-click loop."""
         stuck_iterations = 0
+        screen_classifier = ScreenStateMachine()
         while self.state.autoplay_active:
             try:
                 # ── Step 1: Ad-Shield check ─────────────────────────────────────
@@ -425,6 +427,28 @@ class OverlayWindow:
                         self.dedup.reset()
                         stuck_iterations = 0
                     time.sleep(1.5)
+                    continue
+
+                # ── Step 3b: Screen state classification ────────────────────────
+                # Skip RAG for COMBAT (needs advance, not choice), DIALOGUE, AD, STATS.
+                ad_playing = bool(self.capture and getattr(self.capture, "ad_playing", False))
+                screen_state, _ = screen_classifier.classify(ocr_text, ocr_boxes, ad_playing)
+                if screen_state == ScreenState.COMBAT:
+                    # Battle UI: tap "Begin Battle" / advance; don't RAG
+                    logger.info("⚔️ Combat screen — advancing battle (no RAG)")
+                    if self.clicker:
+                        self.clicker.click_advance_dialog(scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect)
+                    self.dedup.reset()
+                    stuck_iterations = 0
+                    time.sleep(1.5)
+                    continue
+                if screen_state == ScreenState.DIALOGUE:
+                    logger.debug("💬 Dialogue screen — tapping advance (no RAG)")
+                    if self.clicker:
+                        self.clicker.click_advance_dialog(scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect)
+                    self.dedup.reset()
+                    stuck_iterations = 0
+                    time.sleep(1.0)
                     continue
 
                 # ── Step 4: RAG retrieval ───────────────────────────────────────

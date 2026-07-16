@@ -216,23 +216,24 @@ class AIDecisionEngine:
         """
         Decide whether to invoke the PPO Actor-Critic for a second opinion.
         Triggers when:
-          - heuristic confidence (pass_probability) is below threshold, OR
+          - heuristic confidence (pass_probability) is below threshold, AND
           - best-vs-second-best score margin is narrow (indicates weak preference)
+        Avoids noisy overrides when scores are tied or all choices are free (no stat req).
         """
         if not self._ppo_valid:
             return False
-
-        if confidence < self._ppo_confidence_threshold:
-            return True
-
         if len(evaluations) < 2:
             return False
 
+        # If all choices are "free" (no stat check) and scores are tied →
+        # heuristic already made the best pick it can; don't let PPO noise override.
         scores = sorted([ev.get("score", 0.0) for ev in evaluations], reverse=True)
         margin = scores[0] - scores[1] if len(scores) >= 2 else 0.0
-        if margin < self._ppo_score_margin_threshold:
-            return True
 
+        # Require BOTH low confidence AND narrow margin to trigger PPO.
+        # (Previously OR — caused PPO to fire on every tied-score event.)
+        if confidence < self._ppo_confidence_threshold and margin < self._ppo_score_margin_threshold:
+            return True
         return False
 
     def _select_with_ppo(

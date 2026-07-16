@@ -224,7 +224,7 @@ class AutoClicker:
             # to avoid false positives (e.g. "looks" contains "ok").
             if not choice_visible:
                 advance_kws_long = [
-                    "continue", "kembali", "mulai", "begin", "confirm",
+                    "continue", "kembali", "mulai", "confirm",
                     "start", "next", "leave", "siguiente", "continuar", "confirmar",
                     "avanti", "prosseguire", "coba lagi",
                 ]
@@ -263,7 +263,7 @@ class AutoClicker:
 
             # ── 3. Generic Fallback Buttons ─────────────────────────────────────
             if not choice_visible and choice_idx == 0 and choices_count <= 2:
-                fallback_kws = ["begin", "leave", "continue", "confirm", "ok",
+                fallback_kws = ["leave", "continue", "confirm", "ok",
                                "start", "next", "take", "attack", "run", "[1]", "1."]
                 for box in ocr_boxes:
                     center = box.get("center")
@@ -329,8 +329,10 @@ class AutoClicker:
 
         ocr_matched = False
         if ocr_boxes:
+            # NOTE: do NOT include "begin" — "Begin Battle" is a combat button,
+            # not a dialogue advance. Combat is handled by ScreenStateMachine.
             advance_kws_long = [
-                "continue", "kembali", "mulai", "begin", "confirm",
+                "continue", "kembali", "mulai", "confirm",
                 "start", "next", "leave", "siguiente", "continuar", "confirmar",
                 "avanti", "prosseguire", "coba lagi",
             ]
