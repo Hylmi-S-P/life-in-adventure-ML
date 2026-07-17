@@ -68,12 +68,20 @@ class ActionSelector:
     ) -> bool:
         if ad_playing or memory.pending_continue:
             return False
-        # Nav-only screen → no RAG
-        non_rag = self.scanner.first_of(buttons, *_NON_RAG_KINDS)
+        # Binary Yes/No choices also need RAG (E.65) — rare endings matter
+        has_binary = self.scanner.first_of(buttons, "binary")
         has_choice = self.scanner.first_of(buttons, "choice_numbered")
-        if non_rag and not has_choice:
+        # Nav-only screen without binary/choice → no RAG
+        non_rag = self.scanner.first_of(
+            buttons, "combat", "merchant", "recovery", "explore",
+            "social", "quest", "navigation", "popup", "action",
+        )
+        if non_rag and not has_choice and not has_binary:
             return False
         if screen_state == ScreenState.CHOICE:
+            return True
+        # Binary yes/no on any screen: use RAG for alignment-aware pick
+        if has_binary and not self.scanner.first_of(buttons, "continue"):
             return True
         return False
 

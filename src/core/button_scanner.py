@@ -125,6 +125,26 @@ class ButtonScanner:
         for box in boxes:
             text = (box.get("text") or "").strip()
             if not text:
+                # D.56: icon-only button? box with no text but significant area in bottom zone
+                bbox = box.get("bbox")
+                center = box.get("center")
+                if bbox and center and len(center) >= 2 and height > 0:
+                    # check if it's a substantial clickable area
+                    x0, y0 = bbox[0] if bbox[0] else (0,0)
+                    x1, y1 = bbox[2] if len(bbox)>2 else (bbox[1][0] if len(bbox)>1 else (0,0))
+                    if isinstance(x0,(list,tuple)):
+                        x0, y0 = x0
+                    if isinstance(x1,(list,tuple)):
+                        x1, y1 = x1
+                    w = abs(x1 - x0)
+                    h = abs(y1 - y0)
+                    cx, cy = int(center[0]), int(center[1])
+                    zone_y = top + int(height * (1 - _INTERACTIVE_ZONE_BOTTOM)) if height > 0 else 0
+                    if w > 20 and h > 15 and cy >= zone_y:
+                        buttons.append(UIButton(
+                            kind="icon", text="[icon]",
+                            center=(cx, cy), conf=0.5, source="ocr_bbox",
+                        ))
                 continue
             center = box.get("center")
             if not center or len(center) < 2:
@@ -191,8 +211,9 @@ class ButtonScanner:
             "popup": 12,
             "choice_numbered": 13,
             "action": 14,
+            "icon": 15,  # icon-only tiny buttons (D.56)
         }
-        buttons.sort(key=lambda b: (order_priority.get(b.kind, 15), b.center[1]))
+        buttons.sort(key=lambda b: (order_priority.get(b.kind, 16), b.center[1]))
         return buttons
 
     def has_kind(self, buttons: List[UIButton], *kinds: str) -> bool:

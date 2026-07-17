@@ -25,6 +25,7 @@ class AdbBridge:
         self.target_device = target_device
         self.connected = False
         self.adb_screen_size: Optional[Tuple[int, int]] = None
+        self._last_size_check: float = 0.0
         self._auto_connect()
 
     def _run_cmd(self, args: List[str], timeout: float = 3.0) -> Optional[str]:
@@ -165,10 +166,29 @@ class AdbBridge:
         sy = max(0, min(adb_h - 1, sy))
         return sx, sy
 
+    def ensure_size(self, force: bool = False) -> Optional[Tuple[int, int]]:
+        """
+        Re-detect ADB screen size if rotated or stale (G.97).
+        Call before each tap so orientation changes are picked up.
+        """
+        import time
+        now = time.time()
+        if not force and self.adb_screen_size and (now - self._last_size_check) < 30.0:
+            return self.adb_screen_size
+        new_size = self._get_screen_size()
+        if new_size and new_size != self.adb_screen_size:
+            logger.info(f"📱 ADB size changed: {self.adb_screen_size} → {new_size}")
+            self.adb_screen_size = new_size
+        elif new_size:
+            self.adb_screen_size = new_size
+        self._last_size_check = now
+        return self.adb_screen_size
+
     def tap(self, x: int, y: int, win_width: Optional[int] = None, win_height: Optional[int] = None) -> bool:
-        """Tap at emulator coords; scales from PC client-relative with AR clamp."""
+        """Tap at emulator coords; re-check size for rotation, then scale."""
         if not self.connected:
             return False
+        self.ensure_size()
         if win_width and win_height and self.adb_screen_size:
             ox, oy = x, y
             x, y = self._scale_pc_to_adb(x, y, win_width, win_height)

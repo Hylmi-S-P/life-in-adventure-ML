@@ -254,15 +254,7 @@ class ScreenCapture:
         """
         Capture a screenshot and return it with coordinate metadata.
 
-        Returns a CapturedFrame with:
-          - image:       cropped PIL Image (or None on failure)
-          - window_rect: full emulator window rect in screen coords
-          - capture_rect: absolute screen rect of the cropped image
-          - capture_origin: (left, top) screen origin of the cropped image
-
-        Use capture_origin to convert OCR box centers to screen coordinates:
-          screen_x = capture_origin[0] + box_center_x
-          screen_y = capture_origin[1] + box_center_y
+        Includes periodic HWND health check + reconnect if emulator closed.
         """
         now = time.time()
 
@@ -271,10 +263,9 @@ class ScreenCapture:
             time.sleep(self.capture_interval - (now - self.last_capture_time))
         self.last_capture_time = time.time()
 
-        # Periodic window re-scan: timing-based guard.
-        # _find_emulator_window() acquires _rect_lock internally for writes,
-        # so we do NOT double-acquire here.
+        # Periodic window re-scan + HWND health check.
         if now - self._last_window_scan > 15.0:
+            self._health_check_hwnd()
             self._find_emulator_window()
             self._last_window_scan = now
 
@@ -298,20 +289,52 @@ class ScreenCapture:
 
         # Ad detection on the captured (possibly cropped) image.
         self.ad_playing = self.detect_ad_state(img)
-        if self.ad_playing:
-            logger.warning("🛑 ADVERTISEMENT DETECTED! Ad-Shield active. Pausing automation.")
-
-        capture_origin = (
-            capture_rect["left"],
-            capture_rect["top"],
-        ) if capture_rect else (0, 0)
 
         return CapturedFrame(
             image=img,
-            window_rect=window_rect,
-            capture_rect=capture_rect,
-            capture_origin=capture_origin,
+            window_rect=window_rect or {},
+            capture_rect=capture_rect or {},
+            capture_origin=(
+                (capture_rect["left"], capture_rect["top"])
+                if capture_rect else (0, 0)
+            ),
         )
+
+    # ── HWND health check (A.6) ────────────────────────────────────────
+    def _health_check_hwnd(self) -> bool:
+        """
+        Verify emulator HWND is still valid. If not, log warning and
+        allow _find_emulator_window to re-discover it.
+        Returns True if HWND is alive.
+        """
+        if not _WIN32_AVAILABLE:
+            return bool(self.window_rect)
+        with self._rect_lock:
+            hwnd = self.hwnd
+        if hwnd is None:
+            return False
+        try:
+            if not win32gui.IsWindow(hwnd):
+                logger.warning(
+                    f"🪟 Emulator HWND {hwnd} invalid (closed/crashed) — "
+                    f"will re-discover on next scan"
+                )
+                with self._rect_lock:
+                    self.hwnd = None
+                    self.window_rect = None
+                return False
+            # Also check if window is still visible
+            if not win32gui.IsWindowVisible(hwnd):
+                logger.info(f"🪟 Emulator HWND {hwnd} exists but hidden — restoring")
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            return True
+        except Exception as e:
+            logger.error(f"HWND health check failed: {e}")
+            with self._rect_lock:
+                self.hwnd = None
+                self.window_rect = None
+            return False
+
 
     def _capture_raw(self, region: Optional[Dict[str, int]]) -> Optional[Any]:
         """Raw capture — no ad detection, no locking. Called by capture_frame()."""
