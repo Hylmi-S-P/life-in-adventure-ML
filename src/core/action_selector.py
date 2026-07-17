@@ -1,7 +1,8 @@
 """
 action_selector.py - Priority-based action selection for autoplay.
 
-UI navigation buttons beat RAG quest matching.
+Priority: ad > pending_continue > combat > nav/ok/back > merchant/recovery > choice+RAG > action > stuck
+With expanded button kinds from button_scanner.py.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from src.core.screen_state import ScreenState
 
 @dataclass
 class BotAction:
-    type: str  # continue|choice|battle|dismiss|scroll|wait|advance
+    type: str  # continue|choice|combat|merchant|recovery|explore|social|quest|popup|dismiss|action|scroll|wait|advance
     target_text: Optional[str] = None
     target_center: Optional[tuple] = None
     choice_idx: Optional[int] = None
@@ -25,8 +26,35 @@ class BotAction:
     needs_rag: bool = False
 
 
+_NAV_KINDS = frozenset(
+    {
+        "continue",
+        "ok",
+        "back",
+        "close",
+        "navigation",
+        "popup",
+        "binary",
+        "dismiss",
+    }
+)
+_NON_RAG_KINDS = frozenset(
+    {
+        "combat",
+        "merchant",
+        "recovery",
+        "explore",
+        "social",
+        "quest",
+        "navigation",
+        "popup",
+        "action",
+    }
+)
+
+
 class ActionSelector:
-    """Pick next bot action from screen state + buttons + memory (+ optional RAG)."""
+    """Choose next bot action from screen + buttons + memory + optional RAG."""
 
     def __init__(self, scanner: Optional[ButtonScanner] = None):
         self.scanner = scanner or ButtonScanner()
@@ -38,28 +66,16 @@ class ActionSelector:
         memory: SessionMemory,
         ad_playing: bool = False,
     ) -> bool:
-        if ad_playing:
+        if ad_playing or memory.pending_continue:
             return False
-        if memory.pending_continue:
+        # Nav-only screen → no RAG
+        non_rag = self.scanner.first_of(buttons, *_NON_RAG_KINDS)
+        has_choice = self.scanner.first_of(buttons, "choice_numbered")
+        if non_rag and not has_choice:
             return False
-        # Nav buttons take priority — no RAG needed
-        if self.scanner.first_of(
-            buttons, "continue", "ok", "close", "back",
-            "battle_begin", "battle_abandon", "battle_simulate",
-        ):
-            # Exception: pure choice screen may also show "continue" rarely
-            if screen_state == ScreenState.CHOICE and self.scanner.first_of(buttons, "choice"):
-                return True
-            if screen_state in (ScreenState.DIALOGUE, ScreenState.COMBAT):
-                return False
-            # continue-only → no RAG
-            if self.scanner.first_of(buttons, "continue", "ok") and not self.scanner.first_of(
-                buttons, "choice"
-            ):
-                return False
-        if screen_state in (ScreenState.DIALOGUE, ScreenState.COMBAT, ScreenState.AD, ScreenState.STATS):
-            return False
-        return screen_state == ScreenState.CHOICE or screen_state == ScreenState.UNKNOWN
+        if screen_state == ScreenState.CHOICE:
+            return True
+        return False
 
     def select(
         self,
@@ -77,7 +93,7 @@ class ActionSelector:
 
         # 2. Pending continue after a choice click
         if memory.pending_continue:
-            btn = self.scanner.first_of(buttons, "continue", "ok")
+            btn = self.scanner.first_of(buttons, "continue", "ok", "back")
             if btn:
                 return BotAction(
                     type="continue",
@@ -85,69 +101,62 @@ class ActionSelector:
                     target_center=btn.center,
                     reason="pending_continue_button",
                 )
-            # Force advance even without classified button
             return BotAction(type="advance", reason="pending_continue_force")
 
-        # 3. Explicit nav buttons (no RAG)
+        # 3. Nav buttons (no RAG)
         btn = self.scanner.first_of(buttons, "continue")
-        if btn and screen_state != ScreenState.CHOICE:
+        if btn:
             return BotAction(
                 type="continue",
                 target_text=btn.text,
                 target_center=btn.center,
                 reason="continue_button",
             )
-        if btn and screen_state == ScreenState.DIALOGUE:
-            return BotAction(
-                type="continue",
-                target_text=btn.text,
-                target_center=btn.center,
-                reason="dialogue_continue",
-            )
-
-        btn = self.scanner.first_of(buttons, "ok", "close")
+        btn = self.scanner.first_of(buttons, "ok", "back", "close", "binary")
         if btn:
             return BotAction(
-                type="dismiss",
+                type="continue" if btn.kind != "close" else "dismiss",
                 target_text=btn.text,
                 target_center=btn.center,
-                reason=f"dismiss_{btn.kind}",
+                reason=f"nav_{btn.kind}",
             )
 
-        # 4. Battle
-        if screen_state == ScreenState.COMBAT or self.scanner.first_of(
-            buttons, "battle_begin", "battle_simulate", "battle_abandon"
-        ):
-            btn = self.scanner.first_of(buttons, "battle_begin", "battle_simulate")
-            if not btn:
-                btn = self.scanner.first_of(buttons, "battle_abandon")
-            if btn:
-                return BotAction(
-                    type="battle",
-                    target_text=btn.text,
-                    target_center=btn.center,
-                    reason=f"battle_{btn.kind}",
-                )
+        # 4. Combat
+        btn = self.scanner.first_of(
+            buttons, "combat", "choice_numbered"
+        )  # choice_numbered in combat = combat actions
+        if screen_state == ScreenState.COMBAT and btn:
+            return BotAction(
+                type="combat",
+                target_text=btn.text,
+                target_center=btn.center,
+                choice_idx=btn.choice_idx,
+                reason=f"combat_{btn.kind}",
+            )
+        if screen_state == ScreenState.COMBAT:
             return BotAction(type="advance", reason="combat_advance_fallback")
 
-        # 5. Dialogue without choice
-        if screen_state == ScreenState.DIALOGUE:
-            btn = self.scanner.first_of(buttons, "continue", "ok")
+        # 5. Merchant / Recovery / Explore / Social / Quest (non-RAG interactive)
+        for kind in ("merchant", "recovery", "explore", "social", "quest", "navigation", "action"):
+            btn = self.scanner.first_of(buttons, kind)
             if btn:
                 return BotAction(
-                    type="continue",
+                    type=btn.kind,
                     target_text=btn.text,
                     target_center=btn.center,
-                    reason="dialogue_nav",
+                    reason=f"interactive_{kind}",
                 )
+
+        # 6. Dialogue advance (no explicit continue button, but likely dialogue)
+        if screen_state == ScreenState.DIALOGUE:
             return BotAction(type="advance", reason="dialogue_advance")
 
-        # 6. Same-event rematch → force continue
+        # 7. Same-event rematch → force continue
         ekey = None
         if rag_result and rag_result.get("event"):
             ekey = rag_result["event"].get("event_key")
         if ekey and memory.should_force_continue(ekey):
-            btn = self.scanner.first_of(buttons, "continue", "ok")
+            btn = self.scanner.first_of(buttons, "continue", "ok", "action")
             return BotAction(
                 type="continue" if btn else "advance",
                 target_text=btn.text if btn else None,
@@ -156,25 +165,27 @@ class ActionSelector:
                 reason="same_event_force_continue",
             )
 
-        # 7. CHOICE + RAG recommendation
+        # 8. Choice + RAG recommendation
         if rag_result and rag_result.get("matched") and recommendation:
             idx = recommendation.get("recommended_choice_idx", -1)
             if idx is not None and idx >= 0:
-                # Prefer button with matching choice_idx or text
                 choice_txt = recommendation.get("recommended_choice_text") or ""
                 btn = None
                 for b in buttons:
-                    if b.kind == "choice" and b.choice_idx == idx:
+                    if b.kind == "choice_numbered" and b.choice_idx == idx:
                         btn = b
                         break
                 if not btn and choice_txt:
                     cl = choice_txt.lower()
                     for b in buttons:
-                        if b.kind == "choice" and (
+                        if b.kind == "choice_numbered" and (
                             cl in b.text.lower() or b.text.lower() in cl
                         ):
                             btn = b
                             break
+                if not btn:
+                    # Any bottom-zone action button as fallback
+                    btn = self.scanner.first_of(buttons, "action")
                 return BotAction(
                     type="choice",
                     choice_idx=idx,
@@ -184,7 +195,7 @@ class ActionSelector:
                     reason="rag_choice",
                 )
 
-        # Continue visible on ambiguous choice screen without strong RAG
+        # 9. Continue visible on ambiguous screen
         btn = self.scanner.first_of(buttons, "continue")
         if btn:
             return BotAction(
@@ -194,7 +205,7 @@ class ActionSelector:
                 reason="fallback_continue",
             )
 
-        # 8. Stuck recovery
+        # 10. Stuck recovery
         if stuck_iterations >= 2:
             return BotAction(type="scroll", reason="stuck_scroll")
         if stuck_iterations >= 3:

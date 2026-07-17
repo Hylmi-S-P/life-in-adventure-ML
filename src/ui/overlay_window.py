@@ -604,12 +604,16 @@ class OverlayWindow:
         pre_img=None,
         choices_count: int = 1,
     ) -> bool:
-        """Execute a BotAction via AutoClicker; update SessionMemory."""
+        """Execute a BotAction via AutoClicker; update SessionMemory.
+
+        Handles all action types from ActionSelector:
+          continue/advance/dismiss, combat, choice, merchant/recovery/
+          explore/social/quest/navigation/action, scroll, wait.
+        """
         if not self.clicker:
             memory.record(action.type, reason=action.reason + "|no_clicker")
             return False
 
-        ok = False
         ekey = action.event_key
 
         if action.type == "wait":
@@ -625,59 +629,70 @@ class OverlayWindow:
             memory.record("scroll", reason=action.reason)
             return ok
 
+        # ── Nav types: continue, advance, dismiss (click advance dialog) ──────
         if action.type in ("continue", "advance", "dismiss"):
             ok = self.clicker.click_advance_dialog(
-                scroll_first=False,
-                ocr_boxes=ocr_boxes,
-                window_rect=cap_rect,
+                scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect,
             )
             memory.record(
                 "continue" if action.type != "dismiss" else "dismiss",
-                event_key=ekey,
-                reason=action.reason,
+                event_key=ekey, reason=action.reason,
             )
             memory.clear_pending()
             return ok
 
-        if action.type == "battle":
-            # Prefer OCR text match for Begin Battle / Simulate
+        # ── Combat action ────────────────────────────────────────────────
+        if action.type in ("combat", "battle"):
             if action.target_text:
                 ok = self.clicker.click_choice(
-                    0,
-                    window_rect=cap_rect,
-                    choice_text=action.target_text,
-                    ocr_boxes=ocr_boxes,
-                    choices_count=1,
+                    0, window_rect=cap_rect, choice_text=action.target_text,
+                    ocr_boxes=ocr_boxes, choices_count=1,
                 )
             if not ok:
                 ok = self.clicker.click_advance_dialog(
-                    scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect
+                    scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect,
                 )
-            memory.record("battle_begin", reason=action.reason)
+            memory.record("combat", event_key=ekey, reason=action.reason)
             memory.clear_pending()
             return ok
 
+        # ── Interactive non-RAG action (merchant/recovery/explore/…) ──────
+        interactive_kinds = frozenset(
+            "merchant|recovery|explore|social|quest|navigation|popup|action".split("|")
+        )
+        if action.type in interactive_kinds:
+            # Click by text match if available, else geometric advance
+            if action.target_text or action.target_center:
+                ok = self.clicker.click_choice(
+                    0 if action.choice_idx is None else action.choice_idx,
+                    window_rect=cap_rect,
+                    choice_text=action.target_text or "",
+                    ocr_boxes=ocr_boxes,
+                    choices_count=choices_count or 1,
+                )
+            if not ok:
+                ok = self.clicker.click_advance_dialog(
+                    scroll_first=False, ocr_boxes=ocr_boxes, window_rect=cap_rect,
+                )
+            memory.record(action.type, event_key=ekey, reason=action.reason)
+            memory.clear_pending()
+            return ok
+
+        # ── RAG choice ────────────────────────────────────────────────
         if action.type == "choice":
             idx = action.choice_idx if action.choice_idx is not None else 0
             txt = action.target_text or ""
             logger.info(f"🎮 Clicking choice #{idx + 1} ('{txt[:30]}')")
             ok = self.clicker.click_choice(
-                idx,
-                window_rect=cap_rect,
-                choice_text=txt,
-                ocr_boxes=ocr_boxes,
-                choices_count=max(1, choices_count),
+                idx, window_rect=cap_rect, choice_text=txt,
+                ocr_boxes=ocr_boxes, choices_count=max(1, choices_count),
             )
             memory.record(
-                "choice",
-                event_key=ekey,
-                choice_text=txt,
-                choice_idx=idx,
+                "choice", event_key=ekey, choice_text=txt, choice_idx=idx,
                 reason=action.reason,
             )
             if pre_img is not None:
                 self._wait_for_transition(pre_img, cap_rect)
-            # Immediate continue if result screen shows it
             self._maybe_click_continue_after_choice(cap_rect)
             return ok
 
