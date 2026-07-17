@@ -17,6 +17,7 @@ from src.core.screen_state import ScreenStateMachine, ScreenState
 from src.core.button_scanner import ButtonScanner
 from src.core.session_memory import SessionMemory
 from src.core.action_selector import ActionSelector, BotAction
+from src.core.safety import LoadingState, DeadLoopState, MultiStepPlan, detect_dlc, tag_dlc_events
 from src.capture.auto_clicker import AutoClicker
 
 try:
@@ -361,6 +362,9 @@ class OverlayWindow:
         scanner = ButtonScanner()
         selector = ActionSelector(scanner=scanner)
         memory = SessionMemory()
+        loading_state = LoadingState()
+        dead_loop = DeadLoopState(max_repeat=10)
+        multi_step = MultiStepPlan()
 
         while self.state.autoplay_active:
             try:
@@ -424,6 +428,10 @@ class OverlayWindow:
 
                 if not ocr_text or not ocr_text.strip():
                     stuck_iterations += 1
+                    # #5: Loading screen detection
+                    if loading_state.check(ocr_text or ""):
+                        logger.info(f"⏳ Loading screen detected (t+{loading_state.consecutive_no_text*1.5:.0f}s) — waiting")
+                        loading_state.wait(max_wait=12.0)
                     if stuck_iterations >= 3:
                         self._execute_bot_action(
                             BotAction(type="scroll", reason="empty_ocr"),
@@ -567,6 +575,53 @@ class OverlayWindow:
                     pre_img=img,
                     choices_count=len((full_ev or {}).get("choices") or []),
                 )
+                # #4: Dead loop detection
+                ekey_dead = None
+                if full_ev:
+                    ekey_dead = full_ev.get("event_key")
+                if did and dead_loop.record_and_check(
+                    action.type,
+                    event_key=ekey_dead,
+                    screen_text_snapshot=ocr_text or "",
+                ):
+                    logger.warning(
+                        f"🔄 Dead loop detected ({dead_loop.break_count}x) — "
+                        f"breaking: {action.type} on {ekey_dead}"
+                    )
+                    if dead_loop.break_count >= 3:
+                        logger.error("💀 Force-killing autoplay due to 3rd dead loop trigger")
+                        self.state.autoplay_active = False
+                        self.dedup.reset()
+                    else:
+                        # Break pattern: force advance + scroll
+                        self.clicker.scroll_down_dialog(window_rect=cap_rect)
+                        self.clicker.click_advance_dialog(
+                            scroll_first=False, ocr_boxes=[], window_rect=cap_rect
+                        )
+                        self.dedup.reset()
+                    continue
+
+                # #3: Multi-step plan detection
+                if did and action.type not in ("continue", "advance", "dismiss", "wait", "scroll"):
+                    plan_name = MultiStepPlan.match_plan(
+                        action.target_text or action.type
+                    )
+                    if plan_name:
+                        ekey_plan = None
+                        if full_ev:
+                            ekey_plan = full_ev.get("event_key")
+                        multi_step.start_plan(plan_name, event_key=ekey_plan or "")
+                        logger.info(
+                            f"📋 Multi-step plan '{plan_name}' started — "
+                            f"next: {multi_step.get_next_action()}"
+                        )
+                if multi_step.active and did:
+                    next_txt = multi_step.get_next_action()
+                    if next_txt:
+                        logger.info(
+                            f"📋 Plan step {multi_step.current_step + 1}/{len(multi_step.steps)}: "
+                            f"'{next_txt}'"
+                        )
                 if did and action.type in (
                     "choice",
                     "continue",
